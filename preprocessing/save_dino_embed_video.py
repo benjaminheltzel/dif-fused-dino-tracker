@@ -2,6 +2,8 @@ import argparse
 import os
 import torch
 import yaml
+import sys
+sys.path.append('/content/dino-tracker')
 from data.data_utils import load_video
 from utils import add_config_paths, get_dino_features_video
 device = "cuda" if torch.cuda.is_available() else "cpu"
