@@ -2,6 +2,8 @@ import argparse
 import os
 import subprocess
 import yaml
+import sys
+sys.path.append('/content/dino-tracker')
 from preprocessing.main_preprocessing import add_config_paths
 
 
