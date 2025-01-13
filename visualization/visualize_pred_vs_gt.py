@@ -5,6 +5,8 @@ from tqdm import tqdm
 import cv2
 import numpy as np
 
+import sys
+sys.path.append('/content/dino-tracker')
 from data.data_utils import load_video, save_video
 from data.tapvid import get_video_config_by_video_id
 from utils import add_config_paths
