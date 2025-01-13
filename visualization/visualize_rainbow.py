@@ -5,7 +5,8 @@ import os
 import numpy as np
 import torch
 from kornia import morphology as morph
-
+import sys
+sys.path.append('/content/dino-tracker')
 from utils import add_config_paths
 import visualization.viz_utils_tapir as viz_utils
 from data.data_utils import load_video, save_video
