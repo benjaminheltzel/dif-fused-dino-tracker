@@ -2,6 +2,8 @@ import argparse
 import numpy as np
 import torch
 import torch.nn.functional as F
+import sys
+sys.path.append('/content/dino-tracker')
 from data.data_utils import save_video_frames
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
