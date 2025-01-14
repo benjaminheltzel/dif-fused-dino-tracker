@@ -5,7 +5,6 @@ import os
 import pickle
 import sys
 sys.path.append('/content/dino-tracker')
-from utils import add_config_paths
 from eval.metrics import compute_tapvid_metrics_for_video, compute_badja_metrics_for_video
 
 def eval_single_video(args):
