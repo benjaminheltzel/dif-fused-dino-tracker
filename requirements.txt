@@ -6,7 +6,7 @@ antialiased_cnns
 einops
 imageio[ffmpeg]
 kornia
-matplotlib
+matplotlib==3.5.3
 mediapy
 numpy==1.26.4
 pandas
