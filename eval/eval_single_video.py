@@ -72,8 +72,8 @@ if __name__ == "__main__":
     eval_single_video(args)
 
 # example usage:
-# python eval_single_video.py --dataset-root-dir ./dataset/davis_480 \
-#                       --benchmark-pickle-path ./dataset/davis.pkl \
+# python eval_single_video.py --dataset-root-dir ./dataset/tapvid-davis \
+#                       --benchmark-pickle-path ./tapvid/tapvid_davis_data_strided.pkl \
 #                       --out-file ./single_video_metrics.csv \
 #                       --dataset-type tapvid \
 #                       --video-idx 29
