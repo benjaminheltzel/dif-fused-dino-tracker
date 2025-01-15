@@ -60,6 +60,33 @@ class Tracker(nn.Module):
                                         video_h=h,
                                         video_w=w).to(device)
         self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
+
+        # Load CogVideoX features
+        self.cogvideo_features = torch.load("cogvidx_features.pt")
+        hidden_features = self.cogvideo_features['block_14_hidden']
+
+        # Verify feature dimensions
+        assert hidden_features.shape == (1, 10800, 1920), f"Expected CogVideoX features of shape (1, 10800, 1920), got {hidden_features.shape}"
+
+        # Calculate spatial dimensions
+        self.cogvideo_h = 60  # Original height in CogVideoX features
+        self.cogvideo_w = 90  # Original width in CogVideoX features
+        assert self.cogvideo_h * self.cogvideo_w * 2 == 10800, "Spatial dimensions mismatch"
+
+        # Store reshaped features
+        self.cogvideo_spatial = hidden_features.reshape(8, self.cogvideo_h * self.cogvideo_w, 1920)
+
+        # Feature dimensions
+        self.dino_dim = 1024
+        self.cogvideo_dim = 1920
+        self.frames_per_group = 4
+
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(self.cogvideo_dim, self.dino_dim),
+            nn.LayerNorm(self.dino_dim),
+            nn.Linear(self.dino_dim * 2, self.dino_dim),
+            nn.ReLU()
+        ).to(self.device)  # Make sure it's on the right device
     
     @torch.no_grad()
     def load_dino_embed_video(self):
@@ -111,22 +138,52 @@ class Tracker(nn.Module):
         return sampled_embeddings
 
     def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False):
+        # Get DINO embeddings and residuals
         frames_dino_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
         refiner_input_frames = self.video[frames_set_t]
 
-        # compute residual_embeddings in batches of size 8
+        # Compute residuals in batches
         batch_size = 8
         n_frames = frames_set_t.shape[0]
         residual_embeddings = torch.zeros_like(frames_dino_embeddings)
         for i in range(0, n_frames, batch_size):
             end_idx = min(i+batch_size, n_frames)
-            residual_embeddings[i:end_idx] = self.delta_dino(refiner_input_frames[i:end_idx], frames_dino_embeddings[i:end_idx])
+            residual_embeddings[i:end_idx] = self.delta_dino(
+                refiner_input_frames[i:end_idx], 
+                frames_dino_embeddings[i:end_idx]
+            )
 
         refined_embeddings = frames_dino_embeddings + residual_embeddings
 
+        # Get corresponding CogVideoX features
+        cogvideo_indices = frames_set_t // self.frames_per_group
+
+        # Verify indices are in bounds
+        assert torch.all(cogvideo_indices >= 0) and torch.all(cogvideo_indices < 8), \
+            f"Invalid temporal indices: {cogvideo_indices.min()}-{cogvideo_indices.max()}"
+
+        # Get features and reshape to match spatial dimensions
+        B, C, H, W = refined_embeddings.shape
+        assert H == self.cogvideo_h and W == self.cogvideo_w, \
+            f"Spatial dimension mismatch: DINO ({H},{W}) vs CogVideoX ({self.cogvideo_h},{self.cogvideo_w})"
+
+        cogvideo_feat = self.cogvideo_spatial[cogvideo_indices]  # [n_frames, H*W, 1920]
+        cogvideo_feat = cogvideo_feat.reshape(B, H, W, self.cogvideo_dim)
+
+        # Prepare for fusion
+        refined_spatial = refined_embeddings.permute(0, 2, 3, 1)  # [n_frames, H, W, C]
+
+        # Fuse features
+        fused_features = self.feature_fusion(
+            torch.cat([refined_spatial, cogvideo_feat], dim=-1)
+        )
+
+        # Return to DINO format
+        fused_features = fused_features.permute(0, 3, 1, 2)  # [n_frames, C, H, W]
+
         if return_raw_embeddings:
-            return refined_embeddings, residual_embeddings, frames_dino_embeddings
-        return refined_embeddings, residual_embeddings
+            return fused_features, residual_embeddings, frames_dino_embeddings
+        return fused_features, residual_embeddings
     
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
         refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0]))
