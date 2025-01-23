@@ -13,3 +13,4 @@ pandas
 pillow
 tqdm
 PyYAML
+ipykernel

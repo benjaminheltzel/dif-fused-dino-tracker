@@ -62,24 +62,23 @@ class Tracker(nn.Module):
         self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
 
         # Load CogVideoX features
-        self.cogvideo_features = torch.load("cogvidx_features.pt")
+        self.cogvideo_features = torch.load("dino-tracker/cogvidx/cogvidx_features.pt")
         hidden_features = self.cogvideo_features['block_14_hidden']
 
         # Verify feature dimensions
         assert hidden_features.shape == (1, 10800, 1920), f"Expected CogVideoX features of shape (1, 10800, 1920), got {hidden_features.shape}"
 
         # Calculate spatial dimensions
-        self.cogvideo_h = 60  # Original height in CogVideoX features
-        self.cogvideo_w = 90  # Original width in CogVideoX features
-        assert self.cogvideo_h * self.cogvideo_w * 2 == 10800, "Spatial dimensions mismatch"
-
-        # Store reshaped features
-        self.cogvideo_spatial = hidden_features.reshape(8, self.cogvideo_h * self.cogvideo_w, 1920)
-
-        # Feature dimensions
-        self.dino_dim = 1024
+        # The 10800 dimension should be divided into 8 temporal groups since we have 8 compressed frames
+        self.frames_per_group = 4  # Since 32 original frames compressed to 8 frames
+        self.cogvideo_feat_len = 10800 // 8  # Features per frame group
         self.cogvideo_dim = 1920
-        self.frames_per_group = 4
+
+        # Store reshaped features - reshape the [1, 10800, 1920] to [8, 1350, 1920]
+        self.cogvideo_spatial = hidden_features[0].reshape(8, self.cogvideo_feat_len, self.cogvideo_dim)
+
+        # Feature dimensions for fusion
+        self.dino_dim = 1024  # DINO feature dimension
 
         self.feature_fusion = nn.Sequential(
             nn.Linear(self.cogvideo_dim, self.dino_dim),
@@ -161,13 +160,18 @@ class Tracker(nn.Module):
         # Verify indices are in bounds
         assert torch.all(cogvideo_indices >= 0) and torch.all(cogvideo_indices < 8), \
             f"Invalid temporal indices: {cogvideo_indices.min()}-{cogvideo_indices.max()}"
-
-        # Get features and reshape to match spatial dimensions
+    
+        # Get features
         B, C, H, W = refined_embeddings.shape
-        assert H == self.cogvideo_h and W == self.cogvideo_w, \
-            f"Spatial dimension mismatch: DINO ({H},{W}) vs CogVideoX ({self.cogvideo_h},{self.cogvideo_w})"
-
-        cogvideo_feat = self.cogvideo_spatial[cogvideo_indices]  # [n_frames, H*W, 1920]
+        
+        # Get cogvideo features and reshape them to match DINO's spatial dimensions
+        cogvideo_feat = self.cogvideo_spatial[cogvideo_indices]  # [n_frames, 1350, 1920]
+        cogvideo_feat = torch.nn.functional.interpolate(
+            cogvideo_feat.permute(0, 2, 1).unsqueeze(-1),  # [n_frames, 1920, 1350, 1]
+            size=(H * W, 1),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(-1).permute(0, 2, 1)  # [n_frames, H*W, 1920]
         cogvideo_feat = cogvideo_feat.reshape(B, H, W, self.cogvideo_dim)
 
         # Prepare for fusion
