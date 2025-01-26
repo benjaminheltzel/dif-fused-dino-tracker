@@ -63,7 +63,7 @@ class Tracker(nn.Module):
 
         # Load CogVideoX features
         self.cogvideo_features = torch.load("./cogvidx/cogvidx_features.pt")
-        hidden_features = self.cogvideo_features['block_14_hidden']
+        hidden_features = self.cogvideo_features['block_14_hidden'].float()
 
         # Verify feature dimensions
         assert hidden_features.shape == (1, 10800, 1920), f"Expected CogVideoX features of shape (1, 10800, 1920), got {hidden_features.shape}"
@@ -75,17 +75,25 @@ class Tracker(nn.Module):
         self.cogvideo_dim = 1920
 
         # Store reshaped features - reshape the [1, 10800, 1920] to [8, 1350, 1920]
-        self.cogvideo_spatial = hidden_features[0].reshape(8, self.cogvideo_feat_len, self.cogvideo_dim)
+        self.cogvideo_spatial = hidden_features[0].reshape(8, self.cogvideo_feat_len, self.cogvideo_dim).to(self.device)
 
         # Feature dimensions for fusion
         self.dino_dim = 1024  # DINO feature dimension
 
         self.feature_fusion = nn.Sequential(
-            nn.Linear(self.cogvideo_dim, self.dino_dim),
-            nn.LayerNorm(self.dino_dim),
-            nn.Linear(self.dino_dim * 2, self.dino_dim),
-            nn.ReLU()
-        ).to(self.device)  # Make sure it's on the right device
+            # First process CogVideoX features
+            nn.Sequential(
+                nn.LayerNorm(self.cogvideo_dim),  # Normalize before transformation
+                nn.Linear(self.cogvideo_dim, self.dino_dim),
+                nn.ReLU()
+            ),
+            # Then combine with DINO features
+            nn.Sequential(
+                nn.LayerNorm(self.dino_dim * 2),  # Normalize concatenated features
+                nn.Linear(self.dino_dim * 2, self.dino_dim),
+                nn.ReLU()
+            )
+        ).to(self.device)
     
     @torch.no_grad()
     def load_dino_embed_video(self):
@@ -177,12 +185,18 @@ class Tracker(nn.Module):
         # Prepare for fusion
         refined_spatial = refined_embeddings.permute(0, 2, 3, 1)  # [n_frames, H, W, C]
 
-        # Fuse features
-        fused_features = self.feature_fusion(
-            torch.cat([refined_spatial, cogvideo_feat], dim=-1)
+        # Reshape both feature sets to 2D before fusion
+        refined_flat = refined_spatial.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
+        cogvideo_flat = cogvideo_feat.reshape(-1, self.cogvideo_dim)  # [B*H*W, cogvideo_dim]
+        
+        # Two-step fusion process
+        processed_cogvideo = self.feature_fusion[0](cogvideo_flat)  # First transform CogVideoX
+        fused_features = self.feature_fusion[1](
+            torch.cat([refined_flat, processed_cogvideo], dim=-1)
         )
-
-        # Return to DINO format
+        
+        # Reshape back to DINO format
+        fused_features = fused_features.reshape(B, H, W, self.dino_dim)
         fused_features = fused_features.permute(0, 3, 1, 2)  # [n_frames, C, H, W]
 
         if return_raw_embeddings:
