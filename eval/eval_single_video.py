@@ -3,8 +3,6 @@ from tqdm import tqdm
 import pandas as pd
 import os
 import pickle
-import sys
-sys.path.append('/content/dino-tracker')
 from eval.metrics import compute_tapvid_metrics_for_video, compute_badja_metrics_for_video
 
 def eval_single_video(args):

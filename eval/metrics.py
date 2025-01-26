@@ -1,8 +1,6 @@
 import os
 import numpy as np
 from typing import Mapping
-import sys
-sys.path.append('/content/dino-tracker')
 from data.tapvid import get_video_config_by_video_id
 
 

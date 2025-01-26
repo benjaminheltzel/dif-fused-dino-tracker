@@ -62,7 +62,7 @@ class Tracker(nn.Module):
         self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
 
         # Load CogVideoX features
-        self.cogvideo_features = torch.load("dino-tracker/cogvidx/cogvidx_features.pt")
+        self.cogvideo_features = torch.load("./cogvidx/cogvidx_features.pt")
         hidden_features = self.cogvideo_features['block_14_hidden']
 
         # Verify feature dimensions

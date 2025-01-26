@@ -12,8 +12,7 @@ import os
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-import sys
-sys.path.append('/content/dino-tracker')
+
 from data.data_utils import (
     load_image,
     InputPadder,

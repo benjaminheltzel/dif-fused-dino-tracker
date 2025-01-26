@@ -4,8 +4,6 @@ import torchvision.transforms as T
 import argparse
 from tqdm import tqdm
 from einops import rearrange
-import sys
-sys.path.append('/content/dino-tracker')
 from preprocessing_dino_bb.dino_bb_utils import create_meshgrid
 
 

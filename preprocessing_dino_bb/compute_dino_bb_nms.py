@@ -4,8 +4,6 @@ import torch
 from torchvision.ops import batched_nms #, nms
 from torch import einsum
 from tqdm import tqdm
-import sys
-sys.path.append('/content/dino-tracker')
 from preprocessing_dino_bb.dino_bb_utils import create_meshgrid, xy_to_fxy
 
 device = "cuda" if torch.cuda.is_available() else "cpu"

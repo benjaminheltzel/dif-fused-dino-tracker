@@ -1,6 +1,4 @@
 import os 
-import sys
-sys.path.append('/content/dino-tracker')
 from preprocessing_dino_bb.dino_bb_utils import create_meshgrid
 import torch
 import argparse
