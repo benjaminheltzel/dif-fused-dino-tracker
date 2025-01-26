@@ -61,39 +61,71 @@ class Tracker(nn.Module):
                                         video_w=w).to(device)
         self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
 
+
+        ################################################
+        #           CogVideoX Feature Fusion           #
+        ################################################
+
+        # Define transformer blocks for feature pyramid
+        self.transformer_blocks = [0, 7, 14, 21, 29]
+
         # Load CogVideoX features
         self.cogvideo_features = torch.load("./cogvidx/cogvidx_features.pt")
-        hidden_features = self.cogvideo_features['block_14_hidden'].float()
+        self.cogvideo_spatial = {}
+        assert all(f'block_{idx}_hidden' in self.cogvideo_features for idx in self.transformer_blocks), \
+            "Not all required transformer blocks are present in features"
 
-        # Verify feature dimensions
-        assert hidden_features.shape == (1, 10800, 1920), f"Expected CogVideoX features of shape (1, 10800, 1920), got {hidden_features.shape}"
+        # Verify and reshape features for each block
+        for block_idx in self.transformer_blocks:
+            block_features = self.cogvideo_features[f'block_{block_idx}_hidden'].float()
+            assert block_features.shape == (1, 10800, 1920), f"Expected block {block_idx} features shape (1, 10800, 1920), got {block_features.shape}"
+            
+            # Reshape features for each block [1, 10800, 1920] -> [8, 1350, 1920]
+            self.cogvideo_spatial[block_idx] = block_features[0].reshape(
+                8, 10800 // 8, 1920
+            ).to(self.device)
 
         # Calculate spatial dimensions
         # The 10800 dimension should be divided into 8 temporal groups since we have 8 compressed frames
         self.frames_per_group = 4  # Since 32 original frames compressed to 8 frames
         self.cogvideo_feat_len = 10800 // 8  # Features per frame group
         self.cogvideo_dim = 1920
+        self.dino_dim = 1024
 
-        # Store reshaped features - reshape the [1, 10800, 1920] to [8, 1350, 1920]
-        self.cogvideo_spatial = hidden_features[0].reshape(8, self.cogvideo_feat_len, self.cogvideo_dim).to(self.device)
-
-        # Feature dimensions for fusion
-        self.dino_dim = 1024  # DINO feature dimension
-
-        self.feature_fusion = nn.Sequential(
-            # First process CogVideoX features
-            nn.Sequential(
-                nn.LayerNorm(self.cogvideo_dim),  # Normalize before transformation
+        # Create feature pyramid components
+        self.block_projectors = nn.ModuleDict({
+            f'block_{i}': nn.Sequential(
+                nn.LayerNorm(self.cogvideo_dim),
                 nn.Linear(self.cogvideo_dim, self.dino_dim),
                 nn.ReLU()
-            ),
-            # Then combine with DINO features
+            ).to(device) for i in self.transformer_blocks
+        })
+
+        # Lateral connections for feature pyramid
+        self.lateral_convs = nn.ModuleList([
             nn.Sequential(
-                nn.LayerNorm(self.dino_dim * 2),  # Normalize concatenated features
-                nn.Linear(self.dino_dim * 2, self.dino_dim),
-                nn.ReLU()
-            )
+                nn.Conv2d(self.dino_dim, self.dino_dim, 1, bias=False),
+                nn.BatchNorm2d(self.dino_dim)
+            ).to(device)
+            for _ in range(len(self.transformer_blocks) - 1)
+        ])
+
+        # Two-stage fusion architecture
+        # Stage 1: Pyramid feature fusion
+        self.pyramid_fusion = nn.Sequential(
+            nn.LayerNorm(self.dino_dim),
+            nn.Linear(self.dino_dim, self.dino_dim),
+            nn.ReLU()
         ).to(self.device)
+        
+        # Stage 2: Final DINO fusion
+        self.final_fusion = nn.Sequential(
+            nn.LayerNorm(self.dino_dim * 2),  # For concatenated DINO and pyramid features
+            nn.Linear(self.dino_dim * 2, self.dino_dim),
+            nn.ReLU()
+        ).to(self.device)
+
+
     
     @torch.no_grad()
     def load_dino_embed_video(self):
@@ -160,44 +192,84 @@ class Tracker(nn.Module):
                 frames_dino_embeddings[i:end_idx]
             )
 
-        refined_embeddings = frames_dino_embeddings + residual_embeddings
+        refined_dino = frames_dino_embeddings + residual_embeddings
+        B, C, H, W = refined_dino.shape
 
-        # Get corresponding CogVideoX features
+
+        ################################################
+        #           CogVideoX Feature Fusion           #
+        ################################################
+
+        # Get frame indices for CogVideoX features & verify bounds
         cogvideo_indices = frames_set_t // self.frames_per_group
-
-        # Verify indices are in bounds
         assert torch.all(cogvideo_indices >= 0) and torch.all(cogvideo_indices < 8), \
             f"Invalid temporal indices: {cogvideo_indices.min()}-{cogvideo_indices.max()}"
-    
-        # Get features
-        B, C, H, W = refined_embeddings.shape
         
-        # Get cogvideo features and reshape them to match DINO's spatial dimensions
-        cogvideo_feat = self.cogvideo_spatial[cogvideo_indices]  # [n_frames, 1350, 1920]
-        cogvideo_feat = torch.nn.functional.interpolate(
-            cogvideo_feat.permute(0, 2, 1).unsqueeze(-1),  # [n_frames, 1920, 1350, 1]
-            size=(H * W, 1),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(-1).permute(0, 2, 1)  # [n_frames, H*W, 1920]
-        cogvideo_feat = cogvideo_feat.reshape(B, H, W, self.cogvideo_dim)
+        ################################################
+        # Stage 1: Build CogVideoX Feature Pyramid
+        pyramid_features = []
+        for block_idx in self.transformer_blocks:
+            # Get block features - shape: [n_frames, 1350, 1920]
+            block_feat = self.cogvideo_spatial[block_idx][cogvideo_indices]
+            
+            # Permute to [n_frames, 1920, 1350, 1] for interpolation
+            block_feat = block_feat.permute(0, 2, 1).unsqueeze(-1)
+            
+            # Interpolate to match spatial dimensions [n_frames, 1920, H*W, 1]
+            block_feat = torch.nn.functional.interpolate(
+                block_feat,
+                size=(H * W, 1),
+                mode='bilinear',
+                align_corners=False
+            )
 
-        # Prepare for fusion
-        refined_spatial = refined_embeddings.permute(0, 2, 3, 1)  # [n_frames, H, W, C]
+            # Reshape to [n_frames, H*W, 1920] then to [B, H, W, cogvideo_dim]
+            block_feat = block_feat.squeeze(-1).permute(0, 2, 1)
+            block_feat = block_feat.reshape(B, H, W, self.cogvideo_dim)
 
-        # Reshape both feature sets to 2D before fusion
+            # Flatten for projection to DINO dimension
+            block_feat_flat = block_feat.reshape(-1, self.cogvideo_dim)
+            block_feat_projected = self.block_projectors[f'block_{block_idx}'](block_feat_flat)
+            block_feat_spatial = block_feat_projected.reshape(B, H, W, self.dino_dim)
+
+            pyramid_features.append(block_feat_spatial)
+
+        # Apply lateral connections from top to bottom
+        for i in range(len(pyramid_features)-1, 0, -1):
+            # Convert to channel-first format for convolution
+            top_feat = pyramid_features[i].permute(0, 3, 1, 2)  # [B, C, H, W]
+            lateral_feat = pyramid_features[i-1].permute(0, 3, 1, 2)
+
+            # Apply lateral connection
+            fused = lateral_feat + self.lateral_convs[i-1](top_feat)
+            # Convert back to channel-last format
+            pyramid_features[i-1] = fused.permute(0, 2, 3, 1)  # [B, H, W, C]
+
+        # Get final pyramid features (take finest level)
+        final_pyramid = pyramid_features[0]  # [B, H, W, dino_dim]
+
+        # Flatten for pyramid fusion
+        pyramid_flat = final_pyramid.reshape(-1, self.dino_dim)
+        pyramid_features = self.pyramid_fusion(pyramid_flat)
+        pyramid_features = pyramid_features.reshape(B, H, W, self.dino_dim)
+
+        ################################################
+        # Stage 2: Fuse with DINO features
+
+        # Convert DINO features to channel-last format
+        refined_spatial = refined_dino.permute(0, 2, 3, 1)  # [B, H, W, C]
+
+        # Flatten both feature sets for fusion
         refined_flat = refined_spatial.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
-        cogvideo_flat = cogvideo_feat.reshape(-1, self.cogvideo_dim)  # [B*H*W, cogvideo_dim]
-        
-        # Two-step fusion process
-        processed_cogvideo = self.feature_fusion[0](cogvideo_flat)  # First transform CogVideoX
-        fused_features = self.feature_fusion[1](
-            torch.cat([refined_flat, processed_cogvideo], dim=-1)
-        )
-        
-        # Reshape back to DINO format
+        pyramid_flat = pyramid_features.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
+
+        # Final fusion
+        combined = torch.cat([refined_flat, pyramid_flat], dim=-1)  # [B*H*W, 2*dino_dim]
+        fused_features = self.final_fusion(combined)  # [B*H*W, dino_dim]
+
+        # Reshape back to DINO format: [B, C, H, W]
         fused_features = fused_features.reshape(B, H, W, self.dino_dim)
-        fused_features = fused_features.permute(0, 3, 1, 2)  # [n_frames, C, H, W]
+        fused_features = fused_features.permute(0, 3, 1, 2)
 
         if return_raw_embeddings:
             return fused_features, residual_embeddings, frames_dino_embeddings
