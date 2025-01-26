@@ -87,12 +87,12 @@ class DINOTracker():
         video = load_video(video_folder=self.video_path, resize=(self.config["video_resh"], self.config["video_resw"])).to(device)
         tracker_args = {
             "video":video,
+            "video_id": self.video_id,
             "device":device,
             "dino_embed_path": self.dino_embed_path,
             "dino_patch_size": self.config["dino_patch_size"],
             "stride":self.config["stride"],
             "ckpt_path": self.ckpt_folder,
-            
             "cyc_n_frames": self.config["cyc_n_frames"],
             "cyc_batch_size_per_frame": self.config["cyc_batch_size_per_frame"],
             "cyc_fg_points_ratio": self.config["cyc_fg_points_ratio"],
