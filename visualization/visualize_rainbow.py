@@ -4,7 +4,9 @@ from PIL import Image
 import os
 import numpy as np
 import torch
+
 from kornia import morphology as morph
+
 from utils import add_config_paths
 import visualization.viz_utils_tapir as viz_utils
 from data.data_utils import load_video, save_video

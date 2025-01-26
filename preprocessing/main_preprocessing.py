@@ -11,7 +11,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="./configs/preprocessing.yaml", help="Config path", type=str)
-    parser.add_argument("--data-path", default=".dataset/libby", type=str)
+    parser.add_argument("--data-path", default="./dataset/libby", type=str)
 
     args = parser.parse_args()
     with open(args.config, "r") as f:
