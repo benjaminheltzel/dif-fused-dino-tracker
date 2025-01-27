@@ -24,7 +24,7 @@ class DINOTracker():
         
         self.load_config(args.config)
         self.set_paths(args.data_path)
-
+        #self.video_id = args.video_id
         self.orig_video_res_h, self.orig_video_res_w, video_rest = self.get_original_video_res(self.video_path)
         self.range_normalizer = RangeNormalizer(shapes=(self.config["video_resw"], self.config["video_resh"], video_rest)).to(device) # nn.Module
         self.of_loss_fn = torch.nn.HuberLoss(delta=1/32, reduction='none')
@@ -87,7 +87,7 @@ class DINOTracker():
         video = load_video(video_folder=self.video_path, resize=(self.config["video_resh"], self.config["video_resw"])).to(device)
         tracker_args = {
             "video":video,
-            "video_id": self.video_id,
+            #"video_id": self.video_id,
             "device":device,
             "dino_embed_path": self.dino_embed_path,
             "dino_patch_size": self.config["dino_patch_size"],

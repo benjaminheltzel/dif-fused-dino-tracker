@@ -18,7 +18,7 @@ class Tracker(nn.Module):
     def __init__(
         self,
         video=None,
-        video_id=None,
+        #video_id=None,
         ckpt_path="",
         dino_embed_path="",
         dino_patch_size=14,
@@ -44,7 +44,7 @@ class Tracker(nn.Module):
         self.cyc_thresh = cyc_thresh
         
         self.video = video
-        self.video_id = video_id
+        #self.video_id = video_id
         
         # DINO embed
         self.load_dino_embed_video()
@@ -72,7 +72,7 @@ class Tracker(nn.Module):
         self.transformer_blocks = [0, 7, 14, 21, 29]
 
         # Load CogVideoX features
-        self.cogvideo_features = torch.load(f"./diffusion/{self.video_id}/cogvidx_features.pt")
+        self.cogvideo_features = torch.load(f"./diffusion/29/cogvidx_features.pt")
         self.cogvideo_spatial = {}
         assert all(f'block_{idx}_hidden' in self.cogvideo_features for idx in self.transformer_blocks), \
             "Not all required transformer blocks are present in features"
