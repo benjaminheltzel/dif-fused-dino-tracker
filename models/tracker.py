@@ -72,7 +72,7 @@ class Tracker(nn.Module):
         self.transformer_blocks = [0, 7, 14, 21, 29]
 
         # Load CogVideoX features
-        self.cogvideo_features = torch.load(f"./diffusion/29/cogvidx_features.pt")
+        self.cogvideo_features = torch.load(f"./diffusion/29/cogvideox_features.pt")
         self.cogvideo_spatial = {}
         assert all(f'block_{idx}_hidden' in self.cogvideo_features for idx in self.transformer_blocks), \
             "Not all required transformer blocks are present in features"
@@ -100,17 +100,16 @@ class Tracker(nn.Module):
                 nn.LayerNorm(self.cogvideo_dim),
                 nn.Linear(self.cogvideo_dim, self.dino_dim),
                 nn.ReLU()
-            ).to(device) for i in self.transformer_blocks
-        })
+            ) for i in self.transformer_blocks
+        }).to(device)
 
         # Lateral connections for feature pyramid
         self.lateral_convs = nn.ModuleList([
             nn.Sequential(
                 nn.Conv2d(self.dino_dim, self.dino_dim, 1, bias=False),
                 nn.BatchNorm2d(self.dino_dim)
-            ).to(device)
-            for _ in range(len(self.transformer_blocks) - 1)
-        ])
+            ) for _ in range(len(self.transformer_blocks) - 1) 
+        ]).to(device)
 
         # Two-stage fusion architecture
         # Stage 1: Pyramid feature fusion
@@ -128,7 +127,6 @@ class Tracker(nn.Module):
         ).to(self.device)
 
 
-    
     @torch.no_grad()
     def load_dino_embed_video(self):
         """

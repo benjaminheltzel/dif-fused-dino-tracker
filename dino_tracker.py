@@ -109,14 +109,29 @@ class DINOTracker():
     
     def train_setup(self):
         model = self.get_model()
-        params = [{"params": model.delta_dino.parameters(), "lr": self.config["lr_delta_dino"]},
-                  {"params": model.tracker_head.parameters(), "lr": self.config["lr_cnn_refiner"]}]
+        params = [
+            {"params": model.delta_dino.parameters(), "lr": self.config["lr_delta_dino"]},
+            {"params": model.tracker_head.parameters(), "lr": self.config["lr_cnn_refiner"]}
+        ]
         optimizer = torch.optim.Adam(params)                    
-        scheduler = get_cnn_refiner_scheduler(optimizer, gamma=self.config['scheduler_gamma'], apply_every=self.config['apply_scheduler_every'])
+        scheduler = get_cnn_refiner_scheduler(
+            optimizer, 
+            gamma=self.config['scheduler_gamma'], 
+            apply_every=self.config['apply_scheduler_every']
+        )
         
-        if self.init_iter > 0:
-            self.init_scheduler(scheduler, self.init_iter)
-        print("------- INIT ITER", self.init_iter)        
+        # Get last checkpoint iteration
+        checkpoint_iter = get_last_ckpt_iter(self.ckpt_folder)
+        print(f"Found checkpoint at iteration: {checkpoint_iter}")
+        
+        # Load weights if checkpoint exists, but always start counting from -1
+        if checkpoint_iter > 0:
+            print("Loading checkpoint weights...")
+            model.load_weights(checkpoint_iter)
+        
+        # Always set init_iter to -1 to ensure training starts properly
+        self.init_iter = -1
+        print(f"Starting training from iteration {self.init_iter}")
         
         return model, optimizer, scheduler
     
