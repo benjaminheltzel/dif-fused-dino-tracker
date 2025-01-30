@@ -111,14 +111,25 @@ class DINOTracker():
         model = self.get_model()
         params = [
             {"params": model.delta_dino.parameters(), "lr": self.config["lr_delta_dino"]},
-            {"params": model.tracker_head.parameters(), "lr": self.config["lr_cnn_refiner"]}
+            {"params": model.tracker_head.parameters(), "lr": self.config["lr_cnn_refiner"]},
+            {"params": model.block_projectors.parameters(), "lr": self.config["lr_delta_dino"]},
+            {"params": model.lateral_convs.parameters(), "lr": self.config  ["lr_delta_dino"]},
+            {"params": model.pyramid_fusion.parameters(), "lr": self.config ["lr_delta_dino"]},
+            {"params": model.final_fusion.parameters(), "lr": self.config   ["lr_delta_dino"]}
         ]
+
+        print(f"Number of parameter groups: {len(params)}")
+        for i, param_group in enumerate(params):
+            print(f"Group {i} learning rate: {param_group['lr']}")
+
         optimizer = torch.optim.Adam(params)                    
         scheduler = get_cnn_refiner_scheduler(
             optimizer, 
             gamma=self.config['scheduler_gamma'], 
             apply_every=self.config['apply_scheduler_every']
         )
+
+        print(f"Scheduler lambda functions: {len(scheduler.lr_lambdas)}")
         
         # Get last checkpoint iteration
         checkpoint_iter = get_last_ckpt_iter(self.ckpt_folder)
@@ -416,13 +427,28 @@ class DINOTracker():
         model, optimizer, scheduler = self.train_setup()
         self.set_model_train(model)
         self.init_losses()
+
+        # Add diagnostic tracking
+        feature_stats = {
+            'dino_norms': [],
+            'fusion_norms': [],
+            'gradient_norms': []
+        }
         
         for i in tqdm(range(self.init_iter, total_iterations)):
             torch.cuda.empty_cache()
             optimizer.zero_grad()
+
+            # Control diagnostic printing frequency
+            should_print_diagnostics = (i % 1000 == 0)  # Print every 1000  iterations
+            if should_print_diagnostics:
+                print(f"\n{'='*20} Iteration {i} {'='*20}")
+
+
+            # Get inputs and run forward pass with diagnostics
             inputs, labels = self.get_inputs_and_labels(train_sampler)
-            
-            coords = model(inputs)
+            coords = model(inputs, print_diagnostics=should_print_diagnostics)
+
             tracking_loss = self.of_loss_fn(coords, labels).mean()
             loss = tracking_loss
             
@@ -439,7 +465,41 @@ class DINOTracker():
             loss_angle_reg = self.get_emb_angle_regularization_loss(model.module if hasattr(model, "module") else model)
             
             loss += self.config["lambda_cl_dino_bb"] * loss_cl_dino_bb + self.config["lambda_emb_norm"] * loss_emb_norm_reg + self.config["lambda_angle"] * loss_angle_reg
+
+
+            # Print loss components during diagnostic iterations
+            if should_print_diagnostics:
+                print("\nLoss Components:")
+                print(f"Tracking Loss: {tracking_loss.item():.4f}")
+                print(f"DINO BB Loss: {loss_cl_dino_bb.item():.4f}")
+                print(f"Emb Norm Reg: {loss_emb_norm_reg.item():.4f}")
+                print(f"Angle Reg: {loss_angle_reg.item():.4f}")
+                if i >= self.config.get("apply_cl_ref_after", 0):
+                    print(f"Refiner CL Loss: {loss_cl_refiner.item():.4f}")
+                if i >= self.config.get("apply_cyc_after", 0):
+                    print(f"Cycle Consistency Loss: {consistent_track_loss.item():. 4f}")
+                print(f"Total Loss: {loss.item():.4f}")
+                print(f"{'='*50}\n")
+
             loss.backward()
+
+            # Track feature statistics
+            if should_print_diagnostics and hasattr(model, 'frame_embeddings'):
+                feature_stats['dino_norms'].append(model.raw_embeddings.norm().item ())
+                feature_stats['fusion_norms'].append(model.frame_embeddings.norm(). item())
+                print("\nFeature Statistics:")
+                print(f"DINO Features Norm: {feature_stats['dino_norms'][-1]:.4f}")
+                print(f"Fused Features Norm: {feature_stats['fusion_norms'][-1]:.4f}    ")
+                
+                # Compare DINO and fused feature similarity
+                with torch.no_grad():
+                    similarity = torch.nn.functional.cosine_similarity(
+                        model.raw_embeddings.flatten(2),
+                        model.frame_embeddings.flatten(2)
+                    ).mean()
+                    print(f"DINO-Fusion Similarity: {similarity.item():.4f}")
+
+
             optimizer.step()
             scheduler.step()
             

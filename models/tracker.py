@@ -176,10 +176,17 @@ class Tracker(nn.Module):
         sampled_embeddings = sampled_embeddings.permute(1,0)
         return sampled_embeddings
 
-    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False):
+    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False, print_diagnostics=False):
         # Get DINO embeddings and residuals
         frames_dino_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
         refiner_input_frames = self.video[frames_set_t]
+
+        # Print initial DINO feature statistics
+        if print_diagnostics:
+            print("\nInitial DINO Features:")
+            print(f"Mean: {frames_dino_embeddings.mean().item():.4f}")
+            print(f"Std: {frames_dino_embeddings.std().item():.4f}")
+            print(f"Norm: {torch.norm(frames_dino_embeddings).item():.4f}")
 
         # Compute residuals in batches
         batch_size = 8
@@ -193,6 +200,14 @@ class Tracker(nn.Module):
             )
 
         refined_dino = frames_dino_embeddings + residual_embeddings
+
+        # Print refined DINO statistics before fusion
+        if print_diagnostics:
+            print("\nRefined DINO Features (before fusion):")
+            print(f"Mean: {refined_dino.mean().item():.4f}")
+            print(f"Std: {refined_dino.std().item():.4f}")
+            print(f"Norm: {torch.norm(refined_dino).item():.4f}")
+
         B, C, H, W = refined_dino.shape
 
 
@@ -212,6 +227,13 @@ class Tracker(nn.Module):
             # Get block features - shape: [n_frames, 1350, 1920]
             block_feat = self.cogvideo_spatial[block_idx][cogvideo_indices]
             
+            if print_diagnostics:
+                print(f"\nCogVideoX Block {block_idx} Features:")
+                print(f"Mean: {block_feat.mean().item():.4f}")
+                print(f"Std: {block_feat.std().item():.4f}")
+                print(f"Norm: {torch.norm(block_feat).item():.4f}")
+
+
             # Permute to [n_frames, 1920, 1350, 1] for interpolation
             block_feat = block_feat.permute(0, 2, 1).unsqueeze(-1)
             
@@ -233,6 +255,14 @@ class Tracker(nn.Module):
             block_feat_spatial = block_feat_projected.reshape(B, H, W, self.dino_dim)
 
             pyramid_features.append(block_feat_spatial)
+
+        # Print final pyramid feature statistics
+        final_pyramid = pyramid_features[0]
+        if print_diagnostics:
+            print("\nFinal Pyramid Features:")
+            print(f"Mean: {final_pyramid.mean().item():.4f}")
+            print(f"Std: {final_pyramid.std().item():.4f}")
+            print(f"Norm: {torch.norm(final_pyramid).item():.4f}")
 
         # Apply lateral connections from top to bottom
         for i in range(len(pyramid_features)-1, 0, -1):
@@ -266,6 +296,25 @@ class Tracker(nn.Module):
         # Final fusion
         combined = torch.cat([refined_flat, pyramid_flat], dim=-1)  # [B*H*W, 2*dino_dim]
         fused_features = self.final_fusion(combined)  # [B*H*W, dino_dim]
+
+
+        # Print final fused feature statistics
+        if print_diagnostics:
+            print("\nFinal Fused Features:")
+            print(f"Mean: {fused_features.mean().item():.4f}")
+            print(f"Std: {fused_features.std().item():.4f}")
+            print(f"Norm: {torch.norm(fused_features).item():.4f}")
+            print("-" * 50)
+
+        # Add gradient flow tracking
+        def check_grad_hook(grad):
+            if print_diagnostics:
+                print("\nGradient Flow in Fusion:")
+                print(f"Gradient Mean: {grad.mean().item():.4f}")
+                print(f"Gradient Std: {grad.std().item():.4f}")
+                print(f"Gradient Norm: {torch.norm(grad).item():.4f}")
+        fused_features.register_hook(check_grad_hook)
+
 
         # Reshape back to DINO format: [B, C, H, W]
         fused_features = fused_features.reshape(B, H, W, self.dino_dim)
@@ -447,23 +496,29 @@ class Tracker(nn.Module):
 
         return cycle_consistency_preds
 
-    def forward(self, inp, use_raw_features=False):
+    def forward(self, inp, print_diagnostics=False, use_raw_features=False):
         """
         inp: source_points_unnormalized, source_frame_indices, target_frame_indices, frames_set_t; where
         source_points_unnormalized: B x 3. ((x, y, t) in image scale - NOT normalized)
         source_frame_indices: the indices of frames of source points in frames_set_t
         target_frame_indices: the indices of target frames in frames_set_t
         frames_set_t: N, 0 to T-1 (NOT normalized)
+        print_diagnostics: whether to print feature statistics and gradients
         """
         frames_set_t = inp[-1]
-        
+
         if use_raw_features:
             frame_embeddings = raw_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
         elif self.refined_features is not None: # load from cache
             frame_embeddings = self.refined_features[frames_set_t]
             raw_embeddings = self.dino_embed_video[frames_set_t.to(self.dino_embed_video.device)]
         else:
-            frame_embeddings, residual_embeddings, raw_embeddings = self.get_refined_embeddings(frames_set_t, return_raw_embeddings=True)
+            # Pass through the print_diagnostics flag to get_refined_embeddings
+            frame_embeddings, residual_embeddings, raw_embeddings = self.get_refined_embeddings(
+                frames_set_t, 
+                return_raw_embeddings=True,
+                print_diagnostics=print_diagnostics
+            )
             self.residual_embeddings = residual_embeddings
         self.frame_embeddings = frame_embeddings
         self.raw_embeddings = raw_embeddings
