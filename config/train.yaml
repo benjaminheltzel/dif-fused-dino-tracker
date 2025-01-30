@@ -15,8 +15,14 @@ batch_n_frames: 4
 
 ########################## optimization ##########################
 total_iterations: 10000
+
+
+# Learning rate
 lr_delta_dino: 0.01
 lr_cnn_refiner: 0.01
+scheduler_gamma: 0.999
+apply_scheduler_every: 40
+warmup_steps: 1000
 
 
 # Schedulers
@@ -49,6 +55,13 @@ cl_temp: 0.1
 cl_div_dino_bb: 700
 cl_div_ref_bb: 900
 apply_cl_ref_after: 5000
+
+
+# Fusion loss
+lambda_consistency: 0.1  # Weight for temporal consistency
+lambda_diversity: 0.05   # Weight for feature diversity
+lambda_locality: 0.1     # Weight for spatial locality
+
 
 # weighting ambiguity
 bb_amb_sig_a: 27

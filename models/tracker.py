@@ -65,7 +65,7 @@ class Tracker(nn.Module):
 
 
         ################################################
-        #           CogVideoX Feature Fusion           #
+        #           Diffusion Feature Fusion           #
         ################################################
 
         # Define transformer blocks for feature pyramid
@@ -94,6 +94,13 @@ class Tracker(nn.Module):
         self.cogvideo_dim = 1920
         self.dino_dim = 1024
 
+        # Individual normalization layers
+        self.dino_norm = nn.LayerNorm(self.dino_dim)
+        self.cogvideo_norms = nn.ModuleDict({
+            f'block_{i}': nn.InstanceNorm1d(self.cogvideo_dim)
+            for i in self.transformer_blocks
+        })
+
         # Create feature pyramid components
         self.block_projectors = nn.ModuleDict({
             f'block_{i}': nn.Sequential(
@@ -102,6 +109,8 @@ class Tracker(nn.Module):
                 nn.ReLU()
             ) for i in self.transformer_blocks
         }).to(device)
+        # Feature pyramid normalization
+        self.pyramid_norm = nn.LayerNorm(self.dino_dim)
 
         # Lateral connections for feature pyramid
         self.lateral_convs = nn.ModuleList([
@@ -110,6 +119,11 @@ class Tracker(nn.Module):
                 nn.BatchNorm2d(self.dino_dim)
             ) for _ in range(len(self.transformer_blocks) - 1) 
         ]).to(device)
+        # Lateral normalization layers 
+        self.lateral_norms = nn.ModuleList([
+            nn.BatchNorm2d(self.dino_dim)
+            for _ in range(len(self.transformer_blocks) - 1)
+        ])
 
         # Two-stage fusion architecture
         # Stage 1: Pyramid feature fusion
@@ -117,14 +131,24 @@ class Tracker(nn.Module):
             nn.LayerNorm(self.dino_dim),
             nn.Linear(self.dino_dim, self.dino_dim),
             nn.ReLU()
-        ).to(self.device)
-        
+        ).to(self.device)    
         # Stage 2: Final DINO fusion
         self.final_fusion = nn.Sequential(
             nn.LayerNorm(self.dino_dim * 2),  # For concatenated DINO and pyramid features
             nn.Linear(self.dino_dim * 2, self.dino_dim),
             nn.ReLU()
         ).to(self.device)
+        # Final normalization layer
+        self.final_norm = nn.LayerNorm(self.dino_dim)
+
+        # Gate layers for DINO and CogVideoX features
+        self.dino_gate = nn.Linear(self.dino_dim, 1)
+        self.cogvideo_gate = nn.Linear(self.dino_dim, 1)
+
+        # Initialize gates to favor DINO features initially
+        with torch.no_grad():
+            self.dino_gate.bias.fill_(2.0)  # Initially biased towards DINO
+            self.cogvideo_gate.bias.fill_(0.0)
 
 
     @torch.no_grad()
@@ -200,6 +224,7 @@ class Tracker(nn.Module):
             )
 
         refined_dino = frames_dino_embeddings + residual_embeddings
+        refined_dino = self.dino_norm(refined_dino.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # Print refined DINO statistics before fusion
         if print_diagnostics:
@@ -212,7 +237,7 @@ class Tracker(nn.Module):
 
 
         ################################################
-        #           CogVideoX Feature Fusion           #
+        #       Diffusion Feature Fusion - Start       #
         ################################################
 
         # Get frame indices for CogVideoX features & verify bounds
@@ -226,15 +251,15 @@ class Tracker(nn.Module):
         for block_idx in self.transformer_blocks:
             # Get block features - shape: [n_frames, 1350, 1920]
             block_feat = self.cogvideo_spatial[block_idx][cogvideo_indices]
-            
+            block_feat = self.cogvideo_norms[f'block_{block_idx}'](block_feat.unsqueeze(1)).squeeze(1)
+
             if print_diagnostics:
                 print(f"\nCogVideoX Block {block_idx} Features:")
                 print(f"Mean: {block_feat.mean().item():.4f}")
                 print(f"Std: {block_feat.std().item():.4f}")
                 print(f"Norm: {torch.norm(block_feat).item():.4f}")
 
-
-            # Permute to [n_frames, 1920, 1350, 1] for interpolation
+            # Reshape to [n_frames, 1920, 1350, 1] for interpolation
             block_feat = block_feat.permute(0, 2, 1).unsqueeze(-1)
             
             # Interpolate to match spatial dimensions [n_frames, 1920, H*W, 1]
@@ -242,7 +267,7 @@ class Tracker(nn.Module):
                 block_feat,
                 size=(H * W, 1),
                 mode='bilinear',
-                align_corners=False
+                align_corners=True
             )
 
             # Reshape to [n_frames, H*W, 1920] then to [B, H, W, cogvideo_dim]
@@ -256,74 +281,82 @@ class Tracker(nn.Module):
 
             pyramid_features.append(block_feat_spatial)
 
-        # Print final pyramid feature statistics
-        final_pyramid = pyramid_features[0]
-        if print_diagnostics:
-            print("\nFinal Pyramid Features:")
-            print(f"Mean: {final_pyramid.mean().item():.4f}")
-            print(f"Std: {final_pyramid.std().item():.4f}")
-            print(f"Norm: {torch.norm(final_pyramid).item():.4f}")
 
         # Apply lateral connections from top to bottom
         for i in range(len(pyramid_features)-1, 0, -1):
-            # Convert to channel-first format for convolution
-            top_feat = pyramid_features[i].permute(0, 3, 1, 2)  # [B, C, H, W]
+            # Convert to channel-first format for conv [B, C, H, W]
+            top_feat = pyramid_features[i].permute(0, 3, 1, 2)
             lateral_feat = pyramid_features[i-1].permute(0, 3, 1, 2)
 
             # Apply lateral connection
-            fused = lateral_feat + self.lateral_convs[i-1](top_feat)
-            # Convert back to channel-last format
-            pyramid_features[i-1] = fused.permute(0, 2, 3, 1)  # [B, H, W, C]
+            lateral_conv = self.lateral_convs[i-1](top_feat)
 
-        # Get final pyramid features (take finest level)
-        final_pyramid = pyramid_features[0]  # [B, H, W, dino_dim]
+            # Normalize and fuse
+            fused = self.lateral_norms[i-1](lateral_feat + lateral_conv)
+
+            # Convert back to channel-last format [B, H, W, C]
+            pyramid_features[i-1] = fused.permute(0, 2, 3, 1)
+
+
+        # Get final pyramid features
+        final_pyramid = pyramid_features[0]
 
         # Flatten for pyramid fusion
         pyramid_flat = final_pyramid.reshape(-1, self.dino_dim)
+
+        # Apply pyramid fusion
         pyramid_features = self.pyramid_fusion(pyramid_flat)
+
+        pyramid_features = self.pyramid_norm(pyramid_features)
+
+        # Reshape to DINO format: [B, H, W, dino_dim]
         pyramid_features = pyramid_features.reshape(B, H, W, self.dino_dim)
 
         ################################################
-        # Stage 2: Fuse with DINO features
-
-        # Convert DINO features to channel-last format
-        refined_spatial = refined_dino.permute(0, 2, 3, 1)  # [B, H, W, C]
-
-        # Flatten both feature sets for fusion
-        refined_flat = refined_spatial.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
-        pyramid_flat = pyramid_features.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
-
         # Final fusion
-        combined = torch.cat([refined_flat, pyramid_flat], dim=-1)  # [B*H*W, 2*dino_dim]
-        fused_features = self.final_fusion(combined)  # [B*H*W, dino_dim]
+        # Convert DINO features to channel-last format [B, H, W, C]
+        refined_spatial = refined_dino.permute(0, 2, 3, 1)
 
+        # Flatten both feature sets for fusion [B*H*W, dino_dim]
+        refined_flat = refined_spatial.reshape(-1, self.dino_dim)
+        pyramid_flat = pyramid_features.reshape(-1, self.dino_dim)
 
-        # Print final fused feature statistics
+        # Attention-based fusion
+        dino_gate = torch.sigmoid(self.dino_gate(refined_flat))
+        cogvideo_gate = torch.sigmoid(self.cogvideo_gate(pyramid_flat))
+
+        # Apply gates to features
+        combined = torch.cat([
+            dino_gate * refined_flat,
+            cogvideo_gate * pyramid_flat
+        ], dim=-1)
+
+        # Fuse features
+        fused_features = self.final_fusion(combined)
+        fused_features = self.final_norm(fused_features)
+
         if print_diagnostics:
             print("\nFinal Fused Features:")
             print(f"Mean: {fused_features.mean().item():.4f}")
             print(f"Std: {fused_features.std().item():.4f}")
             print(f"Norm: {torch.norm(fused_features).item():.4f}")
+            print(f"DINO Gate Mean: {dino_gate.mean().item():.4f}")
+            print(f"CogVideo Gate Mean: {cogvideo_gate.mean().item():.4f}")
             print("-" * 50)
 
-        # Add gradient flow tracking
-        def check_grad_hook(grad):
-            if print_diagnostics:
-                print("\nGradient Flow in Fusion:")
-                print(f"Gradient Mean: {grad.mean().item():.4f}")
-                print(f"Gradient Std: {grad.std().item():.4f}")
-                print(f"Gradient Norm: {torch.norm(grad).item():.4f}")
-        fused_features.register_hook(check_grad_hook)
-
-
-        # Reshape back to DINO format: [B, C, H, W]
+        # Reshape back to DINO format
         fused_features = fused_features.reshape(B, H, W, self.dino_dim)
         fused_features = fused_features.permute(0, 3, 1, 2)
 
         if return_raw_embeddings:
             return fused_features, residual_embeddings, frames_dino_embeddings
         return fused_features, residual_embeddings
-    
+
+        ################################################
+        #        Diffusion Feature Fusion - End        #
+        ################################################
+
+
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
         refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0]))
         self.refined_features = refined_features

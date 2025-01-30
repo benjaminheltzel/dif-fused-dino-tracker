@@ -109,13 +109,31 @@ class DINOTracker():
     
     def train_setup(self):
         model = self.get_model()
+        
         params = [
-            {"params": model.delta_dino.parameters(), "lr": self.config["lr_delta_dino"]},
-            {"params": model.tracker_head.parameters(), "lr": self.config["lr_cnn_refiner"]},
-            {"params": model.block_projectors.parameters(), "lr": self.config["lr_delta_dino"]},
-            {"params": model.lateral_convs.parameters(), "lr": self.config  ["lr_delta_dino"]},
-            {"params": model.pyramid_fusion.parameters(), "lr": self.config ["lr_delta_dino"]},
-            {"params": model.final_fusion.parameters(), "lr": self.config   ["lr_delta_dino"]}
+            # Feature refinement - moderate lr
+            {"params": model.delta_dino.parameters(), 
+             "lr": self.config["lr_delta_dino"]},
+
+            # Tracker head - stable lr
+            {"params": model.tracker_head.parameters(), 
+             "lr": self.config["lr_cnn_refiner"]},
+
+            # Block projectors - NEED TO TUNE
+            {"params": model.block_projectors.parameters(), 
+             "lr": self.config["lr_delta_dino"] * 0.5},
+
+            # Lateral connections - moderate lr
+            {"params": model.lateral_convs.parameters(), 
+             "lr": self.config["lr_delta_dino"] * 0.7},
+
+            # Pyramid fusion - NEED TO TUNE
+            {"params": model.pyramid_fusion.parameters(), 
+             "lr": self.config["lr_delta_dino"] * 0.3},
+
+            # Final fusion - NEED TO TUNE
+            {"params": model.final_fusion.parameters(), 
+             "lr": self.config["lr_delta_dino"] * 0.2}
         ]
 
         print(f"Number of parameter groups: {len(params)}")
@@ -126,7 +144,8 @@ class DINOTracker():
         scheduler = get_cnn_refiner_scheduler(
             optimizer, 
             gamma=self.config['scheduler_gamma'], 
-            apply_every=self.config['apply_scheduler_every']
+            apply_every=self.config['apply_scheduler_every'],
+            warmup_steps=self.config.get('warmup_steps', 1000)
         )
 
         print(f"Scheduler lambda functions: {len(scheduler.lr_lambdas)}")
@@ -378,6 +397,69 @@ class DINOTracker():
         
         return consistent_track_loss
     
+    ################################################
+    #    Diffusion Feature Fusion Loss - Start     #
+    ################################################
+    def get_feature_consistency_loss(self, model):
+        """
+        Ensures temporal consistency in the fused features by comparing 
+        feature similarities between consecutive frames.
+        """
+        # Get feature similarities from DINO and fused features
+        dino_sims = torch.nn.functional.cosine_similarity(
+            model.raw_embeddings[:, :, 1:], 
+            model.raw_embeddings[:, :, :-1]
+        )
+        fused_sims = torch.nn.functional.cosine_similarity(
+            model.frame_embeddings[:, :, 1:],
+            model.frame_embeddings[:, :, :-1]
+        )
+
+        # The fused features should maintain similar temporal relationships
+        consistency_loss = torch.nn.functional.mse_loss(fused_sims, dino_sims)
+        return consistency_loss
+
+    def get_fusion_diversity_loss(self, model):
+        """
+        Encourages the fusion network to learn complementary features
+        from DINO and CogVideoX rather than just copying one source.
+        """
+        # Get feature correlations
+        dino_fusion_corr = torch.nn.functional.cosine_similarity(
+            model.frame_embeddings.flatten(2),
+            model.raw_embeddings.flatten(2)
+        ).mean()
+
+        # We want some correlation (hence 0.3) but not too much
+        diversity_loss = torch.abs(dino_fusion_corr - 0.3)
+        return diversity_loss
+
+    def get_feature_locality_loss(self, model):
+        """
+        Ensures the fused features maintain spatial locality like DINO features,
+        preventing them from becoming too globally averaged.
+        """
+        # Compute spatial attention maps
+        dino_attn = torch.einsum('bchw,bdhw->bcd', 
+            model.raw_embeddings, model.raw_embeddings)
+        fused_attn = torch.einsum('bchw,bdhw->bcd',
+            model.frame_embeddings, model.frame_embeddings)
+
+        # Normalize attention maps
+        dino_attn = dino_attn / dino_attn.sum(dim=-1, keepdim=True)
+        fused_attn = fused_attn / fused_attn.sum(dim=-1, keepdim=True)
+
+        # The attention patterns should be similar
+        locality_loss = torch.nn.functional.kl_div(
+            fused_attn.log(), dino_attn, reduction='batchmean'
+        )
+        return locality_loss
+    
+    ################################################
+    #     Diffusion Feature Fusion Loss - End      #
+    ################################################
+
+
     def init_losses(self):
         self.running_loss_total = 0.
         self.running_loss_of = 0.
@@ -463,9 +545,26 @@ class DINOTracker():
             loss_cl_dino_bb = self.get_dino_bb_contrastive_loss(model, frames_set_t=inputs[-1])
             loss_emb_norm_reg = self.get_emb_norm_regularization_loss(model.module if hasattr(model, "module") else model)
             loss_angle_reg = self.get_emb_angle_regularization_loss(model.module if hasattr(model, "module") else model)
-            
-            loss += self.config["lambda_cl_dino_bb"] * loss_cl_dino_bb + self.config["lambda_emb_norm"] * loss_emb_norm_reg + self.config["lambda_angle"] * loss_angle_reg
 
+
+            ################################################
+            #       Diffusion Feature Fusion Losses        #
+            ################################################
+            feature_consistency_loss = self.get_feature_consistency_loss(model)
+            fusion_diversity_loss = self.get_fusion_diversity_loss(model)
+            feature_locality_loss = self.get_feature_locality_loss(model)
+
+
+            loss += (
+                self.config["lambda_cl_dino_bb"] * loss_cl_dino_bb + 
+                self.config["lambda_emb_norm"] * loss_emb_norm_reg + 
+                self.config["lambda_angle"] * loss_angle_reg +
+                
+                # Diffusion Feature Fusion Losses
+                self.config["lambda_consistency"] * feature_consistency_loss +
+                self.config["lambda_diversity"] * fusion_diversity_loss +
+                self.config["lambda_locality"] * feature_locality_loss
+            )
 
             # Print loss components during diagnostic iterations
             if should_print_diagnostics:
@@ -474,10 +573,13 @@ class DINOTracker():
                 print(f"DINO BB Loss: {loss_cl_dino_bb.item():.4f}")
                 print(f"Emb Norm Reg: {loss_emb_norm_reg.item():.4f}")
                 print(f"Angle Reg: {loss_angle_reg.item():.4f}")
+                print(f"Feature Consistency Loss: {feature_consistency_loss.item():.4f}")
+                print(f"Fusion Diversity Loss: {fusion_diversity_loss.item():.4f}")
+                print(f"Feature Locality Loss: {feature_locality_loss.item():.4f}")
                 if i >= self.config.get("apply_cl_ref_after", 0):
                     print(f"Refiner CL Loss: {loss_cl_refiner.item():.4f}")
                 if i >= self.config.get("apply_cyc_after", 0):
-                    print(f"Cycle Consistency Loss: {consistent_track_loss.item():. 4f}")
+                    print(f"Cycle Consistency Loss: {consistent_track_loss.item():.4f}")
                 print(f"Total Loss: {loss.item():.4f}")
                 print(f"{'='*50}\n")
 
