@@ -550,21 +550,19 @@ class DINOTracker():
             ################################################
             #       Diffusion Feature Fusion Losses        #
             ################################################
-            feature_consistency_loss = self.get_feature_consistency_loss(model)
-            fusion_diversity_loss = self.get_fusion_diversity_loss(model)
-            feature_locality_loss = self.get_feature_locality_loss(model)
 
 
             loss += (
                 self.config["lambda_cl_dino_bb"] * loss_cl_dino_bb + 
                 self.config["lambda_emb_norm"] * loss_emb_norm_reg + 
-                self.config["lambda_angle"] * loss_angle_reg +
-                
-                # Diffusion Feature Fusion Losses
-                self.config["lambda_consistency"] * feature_consistency_loss +
-                self.config["lambda_diversity"] * fusion_diversity_loss +
-                self.config["lambda_locality"] * feature_locality_loss
+                self.config["lambda_angle"] * loss_angle_reg
             )
+
+            fusion_losses = model.feature_fusion.get_fusion_loss(
+                model.frame_embeddings,
+                model.raw_embeddings
+            )
+            loss += fusion_losses['total']
 
             # Print loss components during diagnostic iterations
             if should_print_diagnostics:
@@ -573,9 +571,9 @@ class DINOTracker():
                 print(f"DINO BB Loss: {loss_cl_dino_bb.item():.4f}")
                 print(f"Emb Norm Reg: {loss_emb_norm_reg.item():.4f}")
                 print(f"Angle Reg: {loss_angle_reg.item():.4f}")
-                print(f"Feature Consistency Loss: {feature_consistency_loss.item():.4f}")
-                print(f"Fusion Diversity Loss: {fusion_diversity_loss.item():.4f}")
-                print(f"Feature Locality Loss: {feature_locality_loss.item():.4f}")
+                print("\nFusion Losses:")
+                print(f"Consistency: {fusion_losses['consistency']:.4f}")
+                print(f"Diversity: {fusion_losses['diversity']:.4f}")
                 if i >= self.config.get("apply_cl_ref_after", 0):
                     print(f"Refiner CL Loss: {loss_cl_refiner.item():.4f}")
                 if i >= self.config.get("apply_cyc_after", 0):
