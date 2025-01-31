@@ -1,6 +1,7 @@
 import logging
 import os
 import torch
+import torch.nn.functional as F
 import yaml
 from pathlib import Path
 from tqdm import tqdm
@@ -8,7 +9,7 @@ from einops import rearrange
 from PIL import Image
 from models.utils import filter_bb_foreground_pairs, get_last_ckpt_iter, get_feature_cos_sims, get_vit_feature_coords_from_mask
 from models.tracker import Tracker
-from optimization.schedulers import get_cnn_refiner_scheduler
+from optimization.schedulers import get_cnn_refiner_scheduler, get_fusion_scheduler
 from data.data_utils import load_video
 from data.dataset import DinoTrackerSampler, RangeNormalizer
 from preprocessing.split_trajectories_to_fg_bg import load_masks
@@ -110,44 +111,37 @@ class DINOTracker():
     def train_setup(self):
         model = self.get_model()
         
-        params = [
-            # Feature refinement - moderate lr
-            {"params": model.delta_dino.parameters(), 
-             "lr": self.config["lr_delta_dino"]},
-
-            # Tracker head - stable lr
-            {"params": model.tracker_head.parameters(), 
-             "lr": self.config["lr_cnn_refiner"]},
-
-            # Block projectors - NEED TO TUNE
-            {"params": model.block_projectors.parameters(), 
-             "lr": self.config["lr_delta_dino"] * 0.5},
-
-            # Lateral connections - moderate lr
-            {"params": model.lateral_convs.parameters(), 
-             "lr": self.config["lr_delta_dino"] * 0.7},
-
-            # Pyramid fusion - NEED TO TUNE
-            {"params": model.pyramid_fusion.parameters(), 
-             "lr": self.config["lr_delta_dino"] * 0.3},
-
-            # Final fusion - NEED TO TUNE
-            {"params": model.final_fusion.parameters(), 
-             "lr": self.config["lr_delta_dino"] * 0.2}
+        tracking_params = [
+            {"params": model.delta_dino.parameters(), "lr": self.config["lr_delta_dino"]},
+            {"params": model.tracker_head.parameters(), "lr": self.config["lr_cnn_refiner"]}
         ]
 
-        print(f"Number of parameter groups: {len(params)}")
-        for i, param_group in enumerate(params):
+        print(f"Number of parameter groups: {len(tracking_params)}")
+        for i, param_group in enumerate(tracking_params):
             print(f"Group {i} learning rate: {param_group['lr']}")
 
-        optimizer = torch.optim.Adam(params)                    
+        optimizer = torch.optim.Adam(tracking_params)                    
         scheduler = get_cnn_refiner_scheduler(
             optimizer, 
             gamma=self.config['scheduler_gamma'], 
             apply_every=self.config['apply_scheduler_every'],
-            warmup_steps=self.config.get('warmup_steps', 1000)
+            warmup_steps=self.config['feature_fusion']['warmup_steps']
         )
 
+        fusion_params = [
+            {"params": model.feature_fusion.pyramid_projectors.parameters(),
+             "lr": self.config["feature_fusion"]["lr_pyramid"]},
+            {"params": model.feature_fusion.pyramid_weights,
+             "lr": self.config["feature_fusion"]["lr_pyramid"]},
+            {"params": model.feature_fusion.pyramid_combiner.parameters(),
+             "lr": self.config["feature_fusion"]["lr_pyramid"]},
+            {"params": model.feature_fusion.final_fusion.parameters(),
+             "lr": self.config["feature_fusion"]["lr_fusion"]}
+        ]
+
+        fusion_optimizer = torch.optim.Adam(fusion_params)
+        fusion_optimizer.clip_grad_norm = 1.0
+        
         print(f"Scheduler lambda functions: {len(scheduler.lr_lambdas)}")
         
         # Get last checkpoint iteration
@@ -163,7 +157,7 @@ class DINOTracker():
         self.init_iter = -1
         print(f"Starting training from iteration {self.init_iter}")
         
-        return model, optimizer, scheduler
+        return model, optimizer, scheduler, fusion_optimizer
     
     def init_scheduler(self, scheduler, iter):
         for i in range(iter):
@@ -506,7 +500,7 @@ class DINOTracker():
 
         self.load_dino_best_buddies()
         train_sampler = self.get_sampler()
-        model, optimizer, scheduler = self.train_setup()
+        model, optimizer, scheduler, fusion_optimizer = self.train_setup()
         self.set_model_train(model)
         self.init_losses()
 
@@ -517,9 +511,17 @@ class DINOTracker():
             'gradient_norms': []
         }
         
+        # Add fusion scheduler
+        fusion_scheduler = get_fusion_scheduler(
+            fusion_optimizer,
+            warmup_steps=self.config["feature_fusion"]["warmup_steps"],
+            gamma=self.config["scheduler_gamma"]
+        )
+
         for i in tqdm(range(self.init_iter, total_iterations)):
             torch.cuda.empty_cache()
             optimizer.zero_grad()
+            fusion_optimizer.zero_grad()
 
             # Control diagnostic printing frequency
             should_print_diagnostics = (i % 1000 == 0)  # Print every 1000  iterations
@@ -530,6 +532,10 @@ class DINOTracker():
             # Get inputs and run forward pass with diagnostics
             inputs, labels = self.get_inputs_and_labels(train_sampler)
             coords = model(inputs, print_diagnostics=should_print_diagnostics)
+
+            ################################################
+            #              DINO-tracker Losses             #
+            ################################################
 
             tracking_loss = self.of_loss_fn(coords, labels).mean()
             loss = tracking_loss
@@ -546,23 +552,29 @@ class DINOTracker():
             loss_emb_norm_reg = self.get_emb_norm_regularization_loss(model.module if hasattr(model, "module") else model)
             loss_angle_reg = self.get_emb_angle_regularization_loss(model.module if hasattr(model, "module") else model)
 
-
-            ################################################
-            #       Diffusion Feature Fusion Losses        #
-            ################################################
-
-
             loss += (
                 self.config["lambda_cl_dino_bb"] * loss_cl_dino_bb + 
                 self.config["lambda_emb_norm"] * loss_emb_norm_reg + 
                 self.config["lambda_angle"] * loss_angle_reg
             )
 
-            fusion_losses = model.feature_fusion.get_fusion_loss(
-                model.frame_embeddings,
-                model.raw_embeddings
+            ################################################
+            #       Diffusion Feature Fusion Losses        #
+            ################################################
+
+            fusion_losses = {
+                'consistency': self.get_feature_consistency_loss(model),
+                'diversity': self.get_fusion_diversity_loss(model),
+                'locality': self.get_feature_locality_loss(model)
+            }
+
+            fusion_loss = (
+                self.config["feature_fusion"]["lambda_consistency"] * fusion_losses['consistency'] +
+                self.config["feature_fusion"]["lambda_diversity"] * fusion_losses['diversity'] +
+                self.config["feature_fusion"]["lambda_locality"] * fusion_losses['locality']
             )
-            loss += fusion_losses['total']
+
+            loss += fusion_loss
 
             # Print loss components during diagnostic iterations
             if should_print_diagnostics:
@@ -572,8 +584,8 @@ class DINOTracker():
                 print(f"Emb Norm Reg: {loss_emb_norm_reg.item():.4f}")
                 print(f"Angle Reg: {loss_angle_reg.item():.4f}")
                 print("\nFusion Losses:")
-                print(f"Consistency: {fusion_losses['consistency']:.4f}")
-                print(f"Diversity: {fusion_losses['diversity']:.4f}")
+                for k, v in fusion_losses.items():
+                    print(f"{k.capitalize()}: {v.item():.4f}")
                 if i >= self.config.get("apply_cl_ref_after", 0):
                     print(f"Refiner CL Loss: {loss_cl_refiner.item():.4f}")
                 if i >= self.config.get("apply_cyc_after", 0):
@@ -581,7 +593,7 @@ class DINOTracker():
                 print(f"Total Loss: {loss.item():.4f}")
                 print(f"{'='*50}\n")
 
-            loss.backward()
+            tracking_loss.backward(retain_graph=True)
 
             # Track feature statistics
             if should_print_diagnostics and hasattr(model, 'frame_embeddings'):
@@ -602,6 +614,11 @@ class DINOTracker():
 
             optimizer.step()
             scheduler.step()
+
+            if i % self.config["feature_fusion"]["fusion_update_freq"] == 0:
+                fusion_loss.backward()
+                fusion_optimizer.step()
+                fusion_scheduler.step()
             
             # logging losses
             self.update_losses(loss.item(), tracking_loss.item(), loss_cl_dino_bb.item(),

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 import os
 import gc
@@ -67,87 +68,17 @@ class Tracker(nn.Module):
         #           Diffusion Feature Fusion           #
         ################################################
 
-        # Define transformer blocks for feature pyramid
-        self.transformer_blocks = [0, 7, 14, 21, 29]
-
+        self.feature_fusion = FeatureFusion(
+            cogvideo_dim=1920,
+            dino_dim=1024,
+            device=device
+        )
+        
         # Load CogVideoX features
-        self.cogvideo_features = torch.load(f"./diffusion/29/cogvideox_features.pt")
-        self.cogvideo_spatial = {}
-        assert all(f'block_{idx}_hidden' in self.cogvideo_features for idx in self.transformer_blocks), \
-            "Not all required transformer blocks are present in features"
-
-        # Verify and reshape features for each block
-        for block_idx in self.transformer_blocks:
-            block_features = self.cogvideo_features[f'block_{block_idx}_hidden'].float()
-            assert block_features.shape == (1, 10800, 1920), f"Expected block {block_idx} features shape (1, 10800, 1920), got {block_features.shape}"
-            
-            # Reshape features for each block [1, 10800, 1920] -> [8, 1350, 1920]
-            self.cogvideo_spatial[block_idx] = block_features[0].reshape(
-                8, 10800 // 8, 1920
-            ).to(self.device)
-
-        # Calculate spatial dimensions
-        # The 10800 dimension should be divided into 8 temporal groups since we have 8 compressed frames
-        self.frames_per_group = 4  # Since 32 original frames compressed to 8 frames
-        self.cogvideo_feat_len = 10800 // 8  # Features per frame group
-        self.cogvideo_dim = 1920
-        self.dino_dim = 1024
-
-        # Individual normalization layers
-        self.dino_norm = nn.LayerNorm(self.dino_dim)
-        self.cogvideo_norms = nn.ModuleDict({
-            f'block_{i}': nn.InstanceNorm1d(self.cogvideo_dim)
-            for i in self.transformer_blocks
-        })
-
-        # Create feature pyramid components
-        self.block_projectors = nn.ModuleDict({
-            f'block_{i}': nn.Sequential(
-                nn.LayerNorm(self.cogvideo_dim),
-                nn.Linear(self.cogvideo_dim, self.dino_dim),
-                nn.ReLU()
-            ) for i in self.transformer_blocks
-        }).to(device)
-        # Feature pyramid normalization
-        self.pyramid_norm = nn.LayerNorm(self.dino_dim)
-
-        # Lateral connections for feature pyramid
-        self.lateral_convs = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(self.dino_dim, self.dino_dim, 1, bias=False),
-                nn.BatchNorm2d(self.dino_dim)
-            ) for _ in range(len(self.transformer_blocks) - 1) 
-        ]).to(device)
-        # Lateral normalization layers 
-        self.lateral_norms = nn.ModuleList([
-            nn.BatchNorm2d(self.dino_dim)
-            for _ in range(len(self.transformer_blocks) - 1)
-        ])
-
-        # Two-stage fusion architecture
-        # Stage 1: Pyramid feature fusion
-        self.pyramid_fusion = nn.Sequential(
-            nn.LayerNorm(self.dino_dim),
-            nn.Linear(self.dino_dim, self.dino_dim),
-            nn.ReLU()
-        ).to(self.device)    
-        # Stage 2: Final DINO fusion
-        self.final_fusion = nn.Sequential(
-            nn.LayerNorm(self.dino_dim * 2),  # For concatenated DINO and pyramid features
-            nn.Linear(self.dino_dim * 2, self.dino_dim),
-            nn.ReLU()
-        ).to(self.device)
-        # Final normalization layer
-        self.final_norm = nn.LayerNorm(self.dino_dim)
-
-        # Gate layers for DINO and CogVideoX features
-        self.dino_gate = nn.Linear(self.dino_dim, 1)
-        self.cogvideo_gate = nn.Linear(self.dino_dim, 1)
-
-        # Initialize gates to favor DINO features initially
-        with torch.no_grad():
-            self.dino_gate.bias.fill_(2.0)  # Initially biased towards DINO
-            self.cogvideo_gate.bias.fill_(0.0)
+        self.cogvideo_features = torch.load(
+            "./diffusion/29/cogvideox_features.pt",
+            map_location=device
+        )
 
 
     @torch.no_grad()
@@ -271,6 +202,14 @@ class Tracker(nn.Module):
     def save_weights(self, iter):
         torch.save(self.tracker_head.state_dict(), Path(self.ckpt_path) / f"tracker_head_{iter}.pt")
         torch.save(self.delta_dino.state_dict(), Path(self.ckpt_path) / f"delta_dino_{iter}.pt")
+
+        fusion_state = {
+            'pyramid_projectors': self.feature_fusion.pyramid_projectors.state_dict(),
+            'pyramid_weights': self.feature_fusion.pyramid_weights,
+            'pyramid_combiner': self.feature_fusion.pyramid_combiner.state_dict(),
+            'final_fusion': self.feature_fusion.final_fusion.state_dict()
+        }
+        torch.save(fusion_state, Path(self.ckpt_path) / f"fusion_{iter}.pt")
         
     def load_weights(self, iter):
         self.tracker_head = load_pre_trained_model(
@@ -462,6 +401,13 @@ class FeatureFusion(nn.Module):
     def __init__(self, cogvideo_dim=1920, dino_dim=1024, device="cuda:0"):
         super().__init__()
         self.device = device
+
+        self.dino_norm = nn.LayerNorm(dino_dim)
+        self.pyramid_norm = nn.LayerNorm(dino_dim)
+
+        temperature = self.config["feature_fusion"]["pyramid_temp"]  # Get from config
+        init_weights = torch.ones(5) + torch.randn(5) * 0.01  # Add small random noise
+        self.pyramid_weights = nn.Parameter(init_weights / temperature)
         
         # Feature pyramid projectors - one for each level
         self.pyramid_projectors = nn.ModuleDict({
@@ -494,6 +440,8 @@ class FeatureFusion(nn.Module):
         Returns:
             Fused features with same shape as DINO features
         """
+        dino_features = self.dino_norm(dino_features.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        
         B, C, H, W = dino_features.shape
         
         # Build feature pyramid
@@ -527,9 +475,10 @@ class FeatureFusion(nn.Module):
                 print(f"Std: {projected_feat.std().item():.4f}")
 
         # Combine pyramid features with learned weights
-        pyramid_weights = F.softmax(torch.randn(len(blocks), device=self.device), dim=0)
+        pyramid_weights = F.softmax(self.pyramid_weights, dim=0)
         combined_pyramid = sum(f * w for f, w in zip(pyramid_features, pyramid_weights))
         combined_pyramid = self.pyramid_combiner(combined_pyramid)  # [B, H, W, 1024]
+        combined_pyramid = self.pyramid_norm(combined_pyramid)
 
         if print_diagnostics:
             print("\nCombined pyramid features:")
