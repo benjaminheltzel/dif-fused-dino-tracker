@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 import os
 import gc
@@ -14,11 +13,11 @@ from utils import bilinear_interpolate_video
 
 EPS = 1e-08
 
+
 class Tracker(nn.Module):
     def __init__(
         self,
         video=None,
-        #video_id=None,
         ckpt_path="",
         dino_embed_path="",
         dino_patch_size=14,
@@ -44,7 +43,6 @@ class Tracker(nn.Module):
         self.cyc_thresh = cyc_thresh
         
         self.video = video
-        #self.video_id = video_id
         
         # DINO embed
         self.load_dino_embed_video()
@@ -68,17 +66,41 @@ class Tracker(nn.Module):
         #           Diffusion Feature Fusion           #
         ################################################
 
-        self.feature_fusion = FeatureFusion(
-            cogvideo_dim=1920,
-            dino_dim=1024,
-            device=device
-        )
         
         # Load CogVideoX features
-        self.cogvideo_features = torch.load(
-            "./diffusion/29/cogvideox_features.pt",
-            map_location=device
-        )
+        self.cogvideo_features = torch.load("./diffusion/29/cogvideox_features.pt")
+
+        hidden_features = self.cogvideo_features['block_14_hidden'].float()
+
+        # Verify feature dimensions
+        assert hidden_features.shape == (1, 10800, 1920), f"Expected CogVideoX features of shape (1, 10800, 1920), got {hidden_features.shape}"
+
+        # Calculate spatial dimensions
+        # The 10800 dimension should be divided into 8 temporal groups since we have 8 compressed frames
+        self.frames_per_group = 4  # Since 32 original frames compressed to 8 frames
+        self.cogvideo_feat_len = 10800 // 8  # Features per frame group
+        self.cogvideo_dim = 1920
+
+        # Store reshaped features - reshape the [1, 10800, 1920] to [8, 1350, 1920]
+        self.cogvideo_spatial = hidden_features[0].reshape(8, self.cogvideo_feat_len, self.cogvideo_dim).to(self.device)
+
+        # Feature dimensions for fusion
+        self.dino_dim = 1024  # DINO feature dimension
+
+        self.feature_fusion = nn.Sequential(
+            # First process CogVideoX features
+            nn.Sequential(
+                nn.LayerNorm(self.cogvideo_dim),  # Normalize before transformation
+                nn.Linear(self.cogvideo_dim, self.dino_dim),
+                nn.ReLU()
+            ),
+            # Then combine with DINO features
+            nn.Sequential(
+                nn.LayerNorm(self.dino_dim * 2),  # Normalize concatenated features
+                nn.Linear(self.dino_dim * 2, self.dino_dim),
+                nn.ReLU()
+            )
+        ).to(self.device)
 
 
     @torch.no_grad()
@@ -130,7 +152,7 @@ class Tracker(nn.Module):
         sampled_embeddings = sampled_embeddings.permute(1,0)
         return sampled_embeddings
 
-    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False, print_diagnostics=False):
+    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False):
         
         ################################################
         #                DINO Embeddings               #
@@ -171,19 +193,46 @@ class Tracker(nn.Module):
         #           Diffusion Feature Fusion           #
         ################################################
 
+        # Get corresponding CogVideoX features
+        cogvideo_indices = frames_set_t // self.frames_per_group
 
-        fused_features = self.feature_fusion(
-            self.cogvideo_features,
-            refined_dino,
-            print_diagnostics=print_diagnostics
+        # Verify indices are in bounds
+        assert torch.all(cogvideo_indices >= 0) and torch.all(cogvideo_indices < 8), \
+            f"Invalid temporal indices: {cogvideo_indices.min()}-{cogvideo_indices.max()}"
+    
+        # Get features
+        B, C, H, W = refined_dino.shape
+        
+        # Get cogvideo features and reshape them to match DINO's spatial dimensions
+        cogvideo_feat = self.cogvideo_spatial[cogvideo_indices]  # [n_frames, 1350, 1920]
+        cogvideo_feat = torch.nn.functional.interpolate(
+            cogvideo_feat.permute(0, 2, 1).unsqueeze(-1),  # [n_frames, 1920, 1350, 1]
+            size=(H * W, 1),
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(-1).permute(0, 2, 1)  # [n_frames, H*W, 1920]
+        cogvideo_feat = cogvideo_feat.reshape(B, H, W, self.cogvideo_dim)
+
+        # Prepare for fusion
+        refined_spatial = refined_dino.permute(0, 2, 3, 1)  # [n_frames, H, W, C]
+
+        # Reshape both feature sets to 2D before fusion
+        refined_flat = refined_spatial.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
+        cogvideo_flat = cogvideo_feat.reshape(-1, self.cogvideo_dim)  # [B*H*W, cogvideo_dim]
+        
+        # Two-step fusion process
+        processed_cogvideo = self.feature_fusion[0](cogvideo_flat)  # First transform CogVideoX
+        fused_features = self.feature_fusion[1](
+            torch.cat([refined_flat, processed_cogvideo], dim=-1)
         )
-
+        
+        # Reshape back to DINO format
+        fused_features = fused_features.reshape(B, H, W, self.dino_dim)
+        fused_features = fused_features.permute(0, 3, 1, 2)  # [n_frames, C, H, W]
 
         if return_raw_embeddings:
             return fused_features, residual_embeddings, frames_dino_embeddings
         return fused_features, residual_embeddings
-
-
 
 
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
@@ -202,14 +251,6 @@ class Tracker(nn.Module):
     def save_weights(self, iter):
         torch.save(self.tracker_head.state_dict(), Path(self.ckpt_path) / f"tracker_head_{iter}.pt")
         torch.save(self.delta_dino.state_dict(), Path(self.ckpt_path) / f"delta_dino_{iter}.pt")
-
-        fusion_state = {
-            'pyramid_projectors': self.feature_fusion.pyramid_projectors.state_dict(),
-            'pyramid_weights': self.feature_fusion.pyramid_weights,
-            'pyramid_combiner': self.feature_fusion.pyramid_combiner.state_dict(),
-            'final_fusion': self.feature_fusion.final_fusion.state_dict()
-        }
-        torch.save(fusion_state, Path(self.ckpt_path) / f"fusion_{iter}.pt")
         
     def load_weights(self, iter):
         self.tracker_head = load_pre_trained_model(
@@ -366,14 +407,13 @@ class Tracker(nn.Module):
 
         return cycle_consistency_preds
 
-    def forward(self, inp, print_diagnostics=False, use_raw_features=False):
+    def forward(self, inp, use_raw_features=False):
         """
         inp: source_points_unnormalized, source_frame_indices, target_frame_indices, frames_set_t; where
         source_points_unnormalized: B x 3. ((x, y, t) in image scale - NOT normalized)
         source_frame_indices: the indices of frames of source points in frames_set_t
         target_frame_indices: the indices of target frames in frames_set_t
         frames_set_t: N, 0 to T-1 (NOT normalized)
-        print_diagnostics: whether to print feature statistics and gradients
         """
         frames_set_t = inp[-1]
 
@@ -383,137 +423,10 @@ class Tracker(nn.Module):
             frame_embeddings = self.refined_features[frames_set_t]
             raw_embeddings = self.dino_embed_video[frames_set_t.to(self.dino_embed_video.device)]
         else:
-            # Pass through the print_diagnostics flag to get_refined_embeddings
-            frame_embeddings, residual_embeddings, raw_embeddings = self.get_refined_embeddings(
-                frames_set_t, 
-                return_raw_embeddings=True,
-                print_diagnostics=print_diagnostics
-            )
+            frame_embeddings, residual_embeddings, raw_embeddings = self.get_refined_embeddings(frames_set_t, return_raw_embeddings=True)
             self.residual_embeddings = residual_embeddings
         self.frame_embeddings = frame_embeddings
         self.raw_embeddings = raw_embeddings
         coords = self.get_point_predictions(inp, frame_embeddings)
 
         return coords
-
-
-class FeatureFusion(nn.Module):
-    def __init__(self, cogvideo_dim=1920, dino_dim=1024, device="cuda:0"):
-        super().__init__()
-        self.device = device
-
-        self.dino_norm = nn.LayerNorm(dino_dim)
-        self.pyramid_norm = nn.LayerNorm(dino_dim)
-
-        temperature = self.config["feature_fusion"]["pyramid_temp"]  # Get from config
-        init_weights = torch.ones(5) + torch.randn(5) * 0.01  # Add small random noise
-        self.pyramid_weights = nn.Parameter(init_weights / temperature)
-        
-        # Feature pyramid projectors - one for each level
-        self.pyramid_projectors = nn.ModuleDict({
-            f'level_{i}': nn.Sequential(
-                nn.LayerNorm(cogvideo_dim),
-                nn.Linear(cogvideo_dim, dino_dim),
-                nn.ReLU()
-            ) for i in range(5)  # For blocks 0, 7, 14, 21, 29
-        }).to(device)
-
-        # Feature pyramid combiner
-        self.pyramid_combiner = nn.Sequential(
-            nn.LayerNorm(dino_dim),
-            nn.Linear(dino_dim, dino_dim),
-            nn.ReLU()
-        ).to(device)
-
-        # Final fusion with DINO features
-        self.final_fusion = nn.Sequential(
-            nn.LayerNorm(dino_dim * 2),  # For concatenated features
-            nn.Linear(dino_dim * 2, dino_dim),
-            nn.ReLU()
-        ).to(device)
-
-    def forward(self, cogvideo_features, dino_features, print_diagnostics=False):
-        """
-        Args:
-            cogvideo_features: Dict of transformer block features
-            dino_features: DINO features [B, C, H, W]
-        Returns:
-            Fused features with same shape as DINO features
-        """
-        dino_features = self.dino_norm(dino_features.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        
-        B, C, H, W = dino_features.shape
-        
-        # Build feature pyramid
-        pyramid_features = []
-        blocks = [0, 7, 14, 21, 29]
-        
-        for idx, block in enumerate(blocks):
-            # Get block features [1, 10800, 1920]
-            block_feat = cogvideo_features[f'block_{block}_hidden']
-            
-            if print_diagnostics:
-                print(f"\nBlock {block} features before processing:")
-                print(f"Mean: {block_feat.mean().item():.4f}")
-                print(f"Std: {block_feat.std().item():.4f}")
-            
-            # Reshape to match spatial dimensions
-            block_feat = block_feat.reshape(B, H, W, -1)  # [B, H, W, 1920]
-            
-            # Project to DINO dimension
-            projected_feat = self.pyramid_projectors[f'level_{idx}'](block_feat)  # [B, H, W, 1024]
-            
-            # Normalize to match DINO scale
-            feat_norm = torch.norm(projected_feat, dim=-1, keepdim=True)
-            projected_feat = projected_feat * torch.norm(dino_features.permute(0, 2, 3, 1), dim=-1, keepdim=True) / (feat_norm + 1e-8)
-            
-            pyramid_features.append(projected_feat)
-            
-            if print_diagnostics:
-                print(f"After projection and normalization:")
-                print(f"Mean: {projected_feat.mean().item():.4f}")
-                print(f"Std: {projected_feat.std().item():.4f}")
-
-        # Combine pyramid features with learned weights
-        pyramid_weights = F.softmax(self.pyramid_weights, dim=0)
-        combined_pyramid = sum(f * w for f, w in zip(pyramid_features, pyramid_weights))
-        combined_pyramid = self.pyramid_combiner(combined_pyramid)  # [B, H, W, 1024]
-        combined_pyramid = self.pyramid_norm(combined_pyramid)
-
-        if print_diagnostics:
-            print("\nCombined pyramid features:")
-            print(f"Mean: {combined_pyramid.mean().item():.4f}")
-            print(f"Std: {combined_pyramid.std().item():.4f}")
-
-        # Prepare DINO features for fusion
-        dino_spatial = dino_features.permute(0, 2, 3, 1)  # [B, H, W, 1024]
-        
-        # Concatenate and fuse
-        fused = torch.cat([dino_spatial, combined_pyramid], dim=-1)  # [B, H, W, 2048]
-        fused = self.final_fusion(fused)  # [B, H, W, 1024]
-        
-        # Return in DINO format
-        return fused.permute(0, 3, 1, 2)  # [B, C, H, W]
-
-    def get_fusion_loss(self, fused_features, dino_features):
-        """
-        Compute losses to guide feature fusion learning
-        """
-        # Consistency loss - fused features shouldn't deviate too far from DINO
-        consistency_loss = 1 - F.cosine_similarity(
-            fused_features.flatten(2),
-            dino_features.flatten(2),
-            dim=2
-        ).mean()
-        
-        # Diversity loss - encourage learning new information
-        diversity_loss = torch.exp(-torch.norm(
-            fused_features.flatten(2) - dino_features.flatten(2),
-            dim=2
-        ).mean())
-        
-        return {
-            'consistency': consistency_loss,
-            'diversity': diversity_loss,
-            'total': consistency_loss + 0.1 * diversity_loss  # Weight diversity loss lower
-        }

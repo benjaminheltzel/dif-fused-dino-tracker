@@ -50,7 +50,6 @@ cl_div_dino_bb: 700
 cl_div_ref_bb: 900
 apply_cl_ref_after: 5000
 
-
 # weighting ambiguity
 bb_amb_sig_a: 27
 bb_amb_sig_b: -5.7
@@ -64,34 +63,3 @@ dino_patch_size: 14
 ########################## Occlusion prediction ##########################
 anchor_cosine_similarity_threshold: 0.7
 cosine_similarity_threshold: 0.6
-
-
-########################## Feature Fusion ##########################
-feature_fusion:
-  # Learning rates for fusion components
-  lr_pyramid: 0.001
-  lr_fusion: 0.0005
-  lr_combiner: 0.0008
-  lr_weights: 0.0003
-
-  scheduler:
-    warmup_curve: "cosine"
-    post_warmup_strategy: "constant"
-    decay_rate: 0.999
-
-  regularization:
-    weight_decay: 1e-4
-    dropout: 0.1
-    feature_dropout: 0.05
-  
-  # Loss weights
-  lambda_consistency: 0.1
-  lambda_diversity: 0.05
-  lambda_locality: 0.1
-  
-  # Training parameters
-  warmup_steps: 1000
-  min_similarity: 0.3  # Target minimum DINO-fusion similarity
-  max_similarity: 0.7  # Target maximum DINO-fusion similarity
-  fusion_update_freq: 2  # Update fusion components every N iterations
-  pyramid_temp: 0.1  # Temperature for pyramid 
