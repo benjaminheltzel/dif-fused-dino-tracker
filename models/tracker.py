@@ -60,49 +60,7 @@ class Tracker(nn.Module):
                                         video_h=h,
                                         video_w=w).to(device)
         self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
-
-
-        ################################################
-        #           Diffusion Feature Fusion           #
-        ################################################
-
-        
-        # Load CogVideoX features
-        self.cogvideo_features = torch.load("./diffusion/29/cogvideox_features.pt")
-
-        hidden_features = self.cogvideo_features['block_14_hidden'].float()
-
-        # Verify feature dimensions
-        assert hidden_features.shape == (1, 10800, 1920), f"Expected CogVideoX features of shape (1, 10800, 1920), got {hidden_features.shape}"
-
-        # Calculate spatial dimensions
-        # The 10800 dimension should be divided into 8 temporal groups since we have 8 compressed frames
-        self.frames_per_group = 4  # Since 32 original frames compressed to 8 frames
-        self.cogvideo_feat_len = 10800 // 8  # Features per frame group
-        self.cogvideo_dim = 1920
-
-        # Store reshaped features - reshape the [1, 10800, 1920] to [8, 1350, 1920]
-        self.cogvideo_spatial = hidden_features[0].reshape(8, self.cogvideo_feat_len, self.cogvideo_dim).to(self.device)
-
-        # Feature dimensions for fusion
-        self.dino_dim = 1024  # DINO feature dimension
-
-        self.feature_fusion = nn.Sequential(
-            # First process CogVideoX features
-            nn.Sequential(
-                nn.LayerNorm(self.cogvideo_dim),  # Normalize before transformation
-                nn.Linear(self.cogvideo_dim, self.dino_dim),
-                nn.ReLU()
-            ),
-            # Then combine with DINO features
-            nn.Sequential(
-                nn.LayerNorm(self.dino_dim * 2),  # Normalize concatenated features
-                nn.Linear(self.dino_dim * 2, self.dino_dim),
-                nn.ReLU()
-            )
-        ).to(self.device)
-
-
+    
     @torch.no_grad()
     def load_dino_embed_video(self):
         """
@@ -152,103 +110,24 @@ class Tracker(nn.Module):
         sampled_embeddings = sampled_embeddings.permute(1,0)
         return sampled_embeddings
 
-    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False, print_diagnostics=False):
-        
-        ################################################
-        #                DINO Embeddings               #
-        ################################################
-        
+    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False):
         frames_dino_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
         refiner_input_frames = self.video[frames_set_t]
 
-        # Print initial DINO feature statistics
-        if print_diagnostics:
-            print("\nInitial DINO Features:")
-            print(f"Mean: {frames_dino_embeddings.mean().item():.4f}")
-            print(f"Std: {frames_dino_embeddings.std().item():.4f}")
-            print(f"Norm: {torch.norm(frames_dino_embeddings).item():.4f}")
-
-        # Compute residuals in batches
+        # compute residual_embeddings in batches of size 8
         batch_size = 8
         n_frames = frames_set_t.shape[0]
         residual_embeddings = torch.zeros_like(frames_dino_embeddings)
         for i in range(0, n_frames, batch_size):
             end_idx = min(i+batch_size, n_frames)
-            residual_embeddings[i:end_idx] = self.delta_dino(
-                refiner_input_frames[i:end_idx], 
-                frames_dino_embeddings[i:end_idx]
-            )
+            residual_embeddings[i:end_idx] = self.delta_dino(refiner_input_frames[i:end_idx], frames_dino_embeddings[i:end_idx])
 
-        refined_dino = frames_dino_embeddings + residual_embeddings
-
-        # Print refined DINO statistics before fusion
-        if print_diagnostics:
-            print("\nRefined DINO Features (before fusion):")
-            print(f"Mean: {refined_dino.mean().item():.4f}")
-            print(f"Std: {refined_dino.std().item():.4f}")
-            print(f"Norm: {torch.norm(refined_dino).item():.4f}")
-
-
-        ################################################
-        #           Diffusion Feature Fusion           #
-        ################################################
-
-        # Get corresponding CogVideoX features
-        cogvideo_indices = frames_set_t // self.frames_per_group
-
-        # Verify indices are in bounds
-        assert torch.all(cogvideo_indices >= 0) and torch.all(cogvideo_indices < 8), \
-            f"Invalid temporal indices: {cogvideo_indices.min()}-{cogvideo_indices.max()}"
-    
-        # Get features
-        B, C, H, W = refined_dino.shape
-        
-        # Get cogvideo features and reshape them to match DINO's spatial dimensions
-        cogvideo_feat = self.cogvideo_spatial[cogvideo_indices]  # [n_frames, 1350, 1920]
-        cogvideo_feat = torch.nn.functional.interpolate(
-            cogvideo_feat.permute(0, 2, 1).unsqueeze(-1),  # [n_frames, 1920, 1350, 1]
-            size=(H * W, 1),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(-1).permute(0, 2, 1)  # [n_frames, H*W, 1920]
-        cogvideo_feat = cogvideo_feat.reshape(B, H, W, self.cogvideo_dim)
-
-        # Prepare for fusion
-        refined_spatial = refined_dino.permute(0, 2, 3, 1)  # [n_frames, H, W, C]
-
-        # Reshape both feature sets to 2D before fusion
-        refined_flat = refined_spatial.reshape(-1, self.dino_dim)  # [B*H*W, dino_dim]
-        cogvideo_flat = cogvideo_feat.reshape(-1, self.cogvideo_dim)  # [B*H*W, cogvideo_dim]
-        
-        # Two-step fusion process
-        processed_cogvideo = self.feature_fusion[0](cogvideo_flat)  # First transform CogVideoX
-        fused_features = self.feature_fusion[1](
-            torch.cat([refined_flat, processed_cogvideo], dim=-1)
-        )
-        
-        # Reshape back to DINO format
-        fused_features = fused_features.reshape(B, H, W, self.dino_dim)
-        fused_features = fused_features.permute(0, 3, 1, 2)  # [n_frames, C, H, W]
-
-        # Print fused features
-        if should_print_diagnostics:
-            print("\nFused Features:")
-            print(f"Mean: {fused_features.mean().item():.4f}")
-            print(f"Std: {fused_features.std().item():.4f}")
-            print(f"Norm: {torch.norm(fused_features).item():.4f}")
-
-        def check_grad_hook(grad):
-            print("\nGradient Flow in Fusion:")
-            print(f"Gradient Mean: {grad.mean().item():.4f}")
-            print(f"Gradient Std: {grad.std().item():.4f}")
-            print(f"Gradient Norm: {torch.norm(grad).item():.4f}")
-        fused_features.register_hook(check_grad_hook)
+        refined_embeddings = frames_dino_embeddings + residual_embeddings
 
         if return_raw_embeddings:
-            return fused_features, residual_embeddings, frames_dino_embeddings
-        return fused_features, residual_embeddings
-
-
+            return refined_embeddings, residual_embeddings, frames_dino_embeddings
+        return refined_embeddings, residual_embeddings
+    
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
         refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0]))
         self.refined_features = refined_features
@@ -430,7 +309,7 @@ class Tracker(nn.Module):
         frames_set_t: N, 0 to T-1 (NOT normalized)
         """
         frames_set_t = inp[-1]
-
+        
         if use_raw_features:
             frame_embeddings = raw_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
         elif self.refined_features is not None: # load from cache

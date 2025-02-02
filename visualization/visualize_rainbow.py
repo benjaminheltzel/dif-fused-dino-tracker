@@ -4,7 +4,6 @@ from PIL import Image
 import os
 import numpy as np
 import torch
-
 from kornia import morphology as morph
 
 from utils import add_config_paths
