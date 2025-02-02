@@ -152,7 +152,7 @@ class Tracker(nn.Module):
         sampled_embeddings = sampled_embeddings.permute(1,0)
         return sampled_embeddings
 
-    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False):
+    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False, print_diagnostics=False):
         
         ################################################
         #                DINO Embeddings               #
@@ -229,6 +229,20 @@ class Tracker(nn.Module):
         # Reshape back to DINO format
         fused_features = fused_features.reshape(B, H, W, self.dino_dim)
         fused_features = fused_features.permute(0, 3, 1, 2)  # [n_frames, C, H, W]
+
+        # Print fused features
+        if should_print_diagnostics:
+            print("\nFused Features:")
+            print(f"Mean: {fused_features.mean().item():.4f}")
+            print(f"Std: {fused_features.std().item():.4f}")
+            print(f"Norm: {torch.norm(fused_features).item():.4f}")
+
+        def check_grad_hook(grad):
+            print("\nGradient Flow in Fusion:")
+            print(f"Gradient Mean: {grad.mean().item():.4f}")
+            print(f"Gradient Std: {grad.std().item():.4f}")
+            print(f"Gradient Norm: {torch.norm(grad).item():.4f}")
+        fused_features.register_hook(check_grad_hook)
 
         if return_raw_embeddings:
             return fused_features, residual_embeddings, frames_dino_embeddings
