@@ -10,6 +10,8 @@ from models.utils import load_pre_trained_model
 from data.dataset import RangeNormalizer
 from utils import bilinear_interpolate_video
 
+from models.fusion.cross_modal_fusion import MultiBlockFusion
+
 
 EPS = 1e-08
 
@@ -60,7 +62,26 @@ class Tracker(nn.Module):
                                         video_h=h,
                                         video_w=w).to(device)
         self.range_normalizer = RangeNormalizer(shapes=(w, h, self.video.shape[0]))
-    
+
+        ###########################################################
+        # Fusion                                                  #
+        ###########################################################
+
+        self.fusion = MultiBlockFusion(
+            cogvideo_dim=1920,
+            dino_dim=1024,
+            num_heads=8
+        )
+        
+        # Load CogVideoX features
+        self.cogvideo_features = torch.load(
+            "./diffusion/29/cogvideox_features.pt",
+            map_location=self.device
+        )
+
+        ###########################################################
+
+
     @torch.no_grad()
     def load_dino_embed_video(self):
         """
@@ -110,8 +131,10 @@ class Tracker(nn.Module):
         sampled_embeddings = sampled_embeddings.permute(1,0)
         return sampled_embeddings
 
-    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False):
+
+    def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False, print_diagnostics=False):
         frames_dino_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
+        
         refiner_input_frames = self.video[frames_set_t]
 
         # compute residual_embeddings in batches of size 8
@@ -124,9 +147,23 @@ class Tracker(nn.Module):
 
         refined_embeddings = frames_dino_embeddings + residual_embeddings
 
+        
+        ###########################################################
+        # Fusion                                                  #
+        ###########################################################
+
+        # Apply fusion
+        fused_features = self.fusion(
+            cogvideo_features=self.cogvideo_features,
+            dino_features=refined_embeddings
+        )
+
+        ###########################################################
+
+
         if return_raw_embeddings:
-            return refined_embeddings, residual_embeddings, frames_dino_embeddings
-        return refined_embeddings, residual_embeddings
+            return fused_features, residual_embeddings, frames_dino_embeddings
+        return fused_features, residual_embeddings
     
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
         refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0]))

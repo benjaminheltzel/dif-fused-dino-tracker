@@ -405,11 +405,9 @@ class DINOTracker():
         for i in tqdm(range(self.init_iter, total_iterations)):
             torch.cuda.empty_cache()
             optimizer.zero_grad()
-
             inputs, labels = self.get_inputs_and_labels(train_sampler)
 
             coords = model(inputs)
-
             tracking_loss = self.of_loss_fn(coords, labels).mean()
             loss = tracking_loss
             
@@ -426,7 +424,6 @@ class DINOTracker():
             loss_angle_reg = self.get_emb_angle_regularization_loss(model.module if hasattr(model, "module") else model)
 
             loss += self.config["lambda_cl_dino_bb"] * loss_cl_dino_bb + self.config["lambda_emb_norm"] * loss_emb_norm_reg + self.config["lambda_angle"] * loss_angle_reg
-
             loss.backward()
             optimizer.step()
             scheduler.step()
