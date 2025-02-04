@@ -93,6 +93,8 @@ class DINOTracker():
             "stride":self.config["stride"],
             "ckpt_path": self.ckpt_folder,
 
+            "video_path": self.video_path,
+
             "cyc_n_frames": self.config["cyc_n_frames"],
             "cyc_batch_size_per_frame": self.config["cyc_batch_size_per_frame"],
             "cyc_fg_points_ratio": self.config["cyc_fg_points_ratio"],

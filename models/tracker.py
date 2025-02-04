@@ -25,6 +25,8 @@ class Tracker(nn.Module):
         dino_patch_size=14,
         stride=7,
         device="cuda:0",
+
+        video_path="",
         
         cyc_n_frames=4,
         cyc_batch_size_per_frame=256,
@@ -45,6 +47,9 @@ class Tracker(nn.Module):
         self.cyc_thresh = cyc_thresh
         
         self.video = video
+
+        self.video_path = video_path
+
         
         # DINO embed
         self.load_dino_embed_video()
@@ -67,14 +72,31 @@ class Tracker(nn.Module):
         # Fusion                                                  #
         ###########################################################
 
-        # Load Diffusion features
-        self.diffusion_features = torch.load(
-            "./diffusion/29/cogvideox_features.pt",
-            map_location=self.device
-        )
+        parent_path = os.path.dirname(self.video_path)
+        video_id = os.path.basename(parent_path)
+        diffusion_path = os.path.join("./diffusion", video_id, "cogvideox_features.pt")
+        print(f"Loading diffusion data from {diffusion_path}")
+
+        if not os.path.exists(diffusion_path):
+            raise FileNotFoundError(f"Diffusion data not found at {diffusion_path}")
         
+        diffusion_data = torch.load(diffusion_path, map_location=self.device)
+
+        diffusion_blocks = [
+            diffusion_data[f'block_{i}_hidden'].to(torch.float32) for i in [0, 14, 29]
+        ]
+
+        self.diffusion_features = torch.stack(diffusion_blocks)
+
         dino_dim=1024
         diffusion_dim=1920
+        frames=8
+
+        self.block_attention = nn.MultiheadAttention(
+            embed_dim=diffusion_dim,
+            num_heads=frames,
+            batch_first=True,
+        )
 
         self.diffusion_projection = nn.Sequential(
             nn.LayerNorm(diffusion_dim), 
@@ -88,9 +110,8 @@ class Tracker(nn.Module):
 
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=dino_dim,
-            num_heads=8,
-            batch_first=True,
-            scale_factor=1.0  
+            num_heads=frames,
+            batch_first=True
         )
 
         self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
@@ -103,7 +124,25 @@ class Tracker(nn.Module):
 
 
         ###########################################################
-
+    
+    def print_tensor_stats(self, name: str, tensor: torch.Tensor):
+        print(f"\n--- {name} ---")
+        print(f"Type:       {tensor.dtype}")
+        print(f"Device:     {tensor.device}")
+        print(f"Shape:      {tuple(tensor.shape)}")
+        print(f"Dimensions: {tensor.ndim}")
+        mean_val = tensor.mean().item()
+        std_val  = tensor.std().item()
+        min_val  = tensor.min().item()
+        max_val  = tensor.max().item()
+        l1_norm  = torch.norm(tensor, p=1).item()
+        l2_norm  = torch.norm(tensor, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
 
     @torch.no_grad()
     def load_dino_embed_video(self):
@@ -156,6 +195,9 @@ class Tracker(nn.Module):
 
 
     def get_refined_embeddings(self, frames_set_t, return_raw_embeddings=False, print_diagnostics=False):
+        #print(f"\nSelected frames: {frames_set_t.tolist()}")
+        #print(f"Number of frames: {len(frames_set_t)}")
+        
         frames_dino_embeddings = self.get_dino_embed_video(frames_set_t=frames_set_t)
         
         refiner_input_frames = self.video[frames_set_t]
@@ -175,150 +217,60 @@ class Tracker(nn.Module):
 
         refined_embeddings = frames_dino_embeddings + residual_embeddings
 
-        print(f"\n--- refined_embeddings ---")
-        print(f"Type:       {refined_embeddings.dtype}")
-        print(f"Device:     {refined_embeddings.device}")
-        print(f"Shape:      {tuple(refined_embeddings.shape)}")
-        print(f"Dimensions: {refined_embeddings.ndim}")
-        mean_val = refined_embeddings.mean().item()
-        std_val  = refined_embeddings.std().item()
-        min_val  = refined_embeddings.min().item()
-        max_val  = refined_embeddings.max().item()
-        l1_norm  = torch.norm(refined_embeddings, p=1).item()
-        l2_norm  = torch.norm(refined_embeddings, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
-
 
         ###########################################################
         # Fusion                                                  #
         ###########################################################
+        #self.print_tensor_stats("refined_embeddings", refined_embeddings)
 
+        diffusion_features = self.diffusion_features.float()
+        #self.print_tensor_stats("diffusion_features", diffusion_features)
+        
+        
+        diffusion_features = diffusion_features.squeeze(1).view(3, 8, 1350, 1920)
+        #self.print_tensor_stats("diffusion_features squeezed", diffusion_features)
+
+
+        fused_features = []
+        for frame_number in frames_set_t:
+            frame_features = diffusion_features[:, frame_number % 8]  
+
+            fused_frame = self.block_attention(
+                frame_features,
+                frame_features, 
+                frame_features,
+                need_weights=False
+            )[0].mean(0)  # [1350, 1920]
+
+            fused_features.append(fused_frame)
+
+        diffusion_embeddings = torch.stack(fused_features)
+        #self.print_tensor_stats("diffusion_embeddings fused", diffusion_embeddings)
+        
+        diffusion_embeddings = self.diffusion_projection(diffusion_embeddings)
+        #self.print_tensor_stats("diffusion_embeddings projected", diffusion_embeddings)
+
+        B, C, H, W = refined_embeddings.shape
+        
         dino_query = refined_embeddings.flatten(2).transpose(1, 2)
-        print(f"\n--- dino_query ---")
-        print(f"Type:       {dino_query.dtype}")
-        print(f"Device:     {dino_query.device}")
-        print(f"Shape:      {tuple(dino_query.shape)}")
-        print(f"Dimensions: {dino_query.ndim}")
-        mean_val = dino_query.mean().item()
-        std_val  = dino_query.std().item()
-        min_val  = dino_query.min().item()
-        max_val  = dino_query.max().item()
-        l1_norm  = torch.norm(dino_query, p=1).item()
-        l2_norm  = torch.norm(dino_query, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
-
-        diffusion_kv = self.diffusion_projection(self.diffusion_features)
-        print(f"\n--- diffusion_kv ---")
-        print(f"Type:       {diffusion_kv.dtype}")
-        print(f"Device:     {diffusion_kv.device}")
-        print(f"Shape:      {tuple(diffusion_kv.shape)}")
-        print(f"Dimensions: {diffusion_kv.ndim}")
-        mean_val = diffusion_kv.mean().item()
-        std_val  = diffusion_kv.std().item()
-        min_val  = diffusion_kv.min().item()
-        max_val  = diffusion_kv.max().item()
-        l1_norm  = torch.norm(diffusion_kv, p=1).item()
-        l2_norm  = torch.norm(diffusion_kv, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
+        #self.print_tensor_stats("dino_query", dino_query)
 
         attended = self.cross_attention(
             dino_query,  
-            diffusion_kv,
-            diffusion_kv
+            diffusion_embeddings,
+            diffusion_embeddings
         )[0]
 
-        print(f"\n--- attended ---")
-        print(f"Type:       {attended.dtype}")
-        print(f"Device:     {attended.device}")
-        print(f"Shape:      {tuple(attended.shape)}")
-        print(f"Dimensions: {attended.ndim}")
-        mean_val = attended.mean().item()
-        std_val  = attended.std().item()
-        min_val  = attended.min().item()
-        max_val  = attended.max().item()
-        l1_norm  = torch.norm(attended, p=1).item()
-        l2_norm  = torch.norm(attended, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
-
         attended_embeddings = dino_query + self.output_scale * attended
-        print(f"\n--- attended_embeddings ---")
-        print(f"Type:       {attended_embeddings.dtype}")
-        print(f"Device:     {attended_embeddings.device}")
-        print(f"Shape:      {tuple(attended_embeddings.shape)}")
-        print(f"Dimensions: {attended_embeddings.ndim}")
-        mean_val = attended_embeddings.mean().item()
-        std_val  = attended_embeddings.std().item()
-        min_val  = attended_embeddings.min().item()
-        max_val  = attended_embeddings.max().item()
-        l1_norm  = torch.norm(attended_embeddings, p=1).item()
-        l2_norm  = torch.norm(attended_embeddings, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
+        #self.print_tensor_stats("attended_embeddings", attended_embeddings)
 
         fused_embeddings = attended_embeddings + self.output_scale * self.mlp(attended_embeddings)
-        print(f"\n--- fused_embeddings ---")
-        print(f"Type:       {fused_embeddings.dtype}")
-        print(f"Device:     {fused_embeddings.device}")
-        print(f"Shape:      {tuple(fused_embeddings.shape)}")
-        print(f"Dimensions: {fused_embeddings.ndim}")
-        mean_val = fused_embeddings.mean().item()
-        std_val  = fused_embeddings.std().item()
-        min_val  = fused_embeddings.min().item()
-        max_val  = fused_embeddings.max().item()
-        l1_norm  = torch.norm(fused_embeddings, p=1).item()
-        l2_norm  = torch.norm(fused_embeddings, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
+        #self.print_tensor_stats("fused_embeddings", fused_embeddings)
 
-        fused_embeddings = fused_embeddings.transpose(1, 2).reshape(refined_embeddings.shape)
-        print(f"\n--- fused_embeddings ---")
-        print(f"Type:       {fused_embeddings.dtype}")
-        print(f"Device:     {fused_embeddings.device}")
-        print(f"Shape:      {tuple(fused_embeddings.shape)}")
-        print(f"Dimensions: {fused_embeddings.ndim}")
-        mean_val = fused_embeddings.mean().item()
-        std_val  = fused_embeddings.std().item()
-        min_val  = fused_embeddings.min().item()
-        max_val  = fused_embeddings.max().item()
-        l1_norm  = torch.norm(fused_embeddings, p=1).item()
-        l2_norm  = torch.norm(fused_embeddings, p=2).item()
-        print(f"Mean:       {mean_val:.6f}")
-        print(f"Std:        {std_val:.6f}")
-        print(f"Min:        {min_val:.6f}")
-        print(f"Max:        {max_val:.6f}")
-        print(f"L1 Norm:    {l1_norm:.6f}")
-        print(f"L2 Norm:    {l2_norm:.6f}")
+        fused_embeddings = fused_embeddings.transpose(1, 2).reshape(B, C, H, W)
+        #self.print_tensor_stats("fused_embeddings reshaped", fused_embeddings)
 
         ###########################################################
-
 
         if return_raw_embeddings:
             return fused_embeddings, residual_embeddings, frames_dino_embeddings
