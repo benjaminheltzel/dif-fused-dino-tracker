@@ -261,10 +261,10 @@ class Tracker(nn.Module):
             diffusion_embeddings
         )[0]
 
-        attended_embeddings = dino_query + self.output_scale * attended
+        attended_embeddings = dino_query + attended
         #self.print_tensor_stats("attended_embeddings", attended_embeddings)
 
-        fused_embeddings = attended_embeddings + self.output_scale * self.mlp(attended_embeddings)
+        fused_embeddings = attended_embeddings + self.mlp(attended_embeddings)
         #self.print_tensor_stats("fused_embeddings", fused_embeddings)
 
         fused_embeddings = fused_embeddings.transpose(1, 2).reshape(B, C, H, W)
