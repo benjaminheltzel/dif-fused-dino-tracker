@@ -10,7 +10,7 @@ from models.utils import load_pre_trained_model
 from data.dataset import RangeNormalizer
 from utils import bilinear_interpolate_video
 
-from models.fusion.cross_modal_fusion import MultiBlockFusion
+from models.fusion.main_fusion import MainFusion
 
 
 EPS = 1e-08
@@ -67,17 +67,42 @@ class Tracker(nn.Module):
         # Fusion                                                  #
         ###########################################################
 
-        self.fusion = MultiBlockFusion(
-            cogvideo_dim=1920,
-            dino_dim=1024,
-            num_heads=8
-        )
-        
-        # Load CogVideoX features
-        self.cogvideo_features = torch.load(
+        # Load Diffusion features
+        self.diffusion_features = torch.load(
             "./diffusion/29/cogvideox_features.pt",
             map_location=self.device
         )
+        
+        dino_dim=1024
+        diffusion_dim=1920
+
+        self.diffusion_projection = nn.Sequential(
+            nn.LayerNorm(diffusion_dim), 
+            nn.Linear(diffusion_dim, diffusion_dim // 2),
+            nn.GELU(),
+            nn.LayerNorm(diffusion_dim // 2),
+            nn.Linear(diffusion_dim // 2, dino_dim),
+            nn.GELU(),
+            nn.LayerNorm(dino_dim)
+        )
+
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=dino_dim,
+            num_heads=8,
+            batch_first=True,
+            scale_factor=1.0  
+        )
+
+        self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(dino_dim, dino_dim * 4),
+            nn.GELU(),
+            nn.Linear(dino_dim * 4, dino_dim)
+        )
+
+
+
 
         ###########################################################
 
@@ -139,31 +164,46 @@ class Tracker(nn.Module):
 
         # compute residual_embeddings in batches of size 8
         batch_size = 8
+
         n_frames = frames_set_t.shape[0]
+
         residual_embeddings = torch.zeros_like(frames_dino_embeddings)
+
         for i in range(0, n_frames, batch_size):
+
             end_idx = min(i+batch_size, n_frames)
+
             residual_embeddings[i:end_idx] = self.delta_dino(refiner_input_frames[i:end_idx], frames_dino_embeddings[i:end_idx])
 
         refined_embeddings = frames_dino_embeddings + residual_embeddings
 
-        
+
         ###########################################################
         # Fusion                                                  #
         ###########################################################
 
-        # Apply fusion
-        fused_features = self.fusion(
-            cogvideo_features=self.cogvideo_features,
-            dino_features=refined_embeddings
-        )
+        dino_query = refined_embeddings.flatten(2).transpose(1, 2)
+
+        diffusion_kv = self.diffusion_projection(self.diffusion_features)
+
+        attended = self.cross_attention(
+            dino_query,  
+            diffusion_kv,
+            diffusion_kv
+        )[0]
+
+        attended_embeddings = dino_query + self.output_scale * attended
+
+        fused_embeddings = attended_embeddings + self.output_scale * self.mlp(attended_embeddings)
+
+        fused_embeddings = fused_embeddings.transpose(1, 2).reshape(refined_embeddings.shape)
 
         ###########################################################
 
 
         if return_raw_embeddings:
-            return fused_features, residual_embeddings, frames_dino_embeddings
-        return fused_features, residual_embeddings
+            return fused_embeddings, residual_embeddings, frames_dino_embeddings
+        return fused_embeddings, residual_embeddings
     
     def cache_refined_embeddings(self, move_dino_to_cpu=False):
         refined_features, _ = self.get_refined_embeddings(torch.arange(0, self.video.shape[0]))
