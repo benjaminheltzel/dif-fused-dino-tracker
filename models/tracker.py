@@ -102,8 +102,6 @@ class Tracker(nn.Module):
         )
 
 
-
-
         ###########################################################
 
 
@@ -177,14 +175,66 @@ class Tracker(nn.Module):
 
         refined_embeddings = frames_dino_embeddings + residual_embeddings
 
+        print(f"\n--- refined_embeddings ---")
+        print(f"Type:       {refined_embeddings.dtype}")
+        print(f"Device:     {refined_embeddings.device}")
+        print(f"Shape:      {tuple(refined_embeddings.shape)}")
+        print(f"Dimensions: {refined_embeddings.ndim}")
+        mean_val = refined_embeddings.mean().item()
+        std_val  = refined_embeddings.std().item()
+        min_val  = refined_embeddings.min().item()
+        max_val  = refined_embeddings.max().item()
+        l1_norm  = torch.norm(refined_embeddings, p=1).item()
+        l2_norm  = torch.norm(refined_embeddings, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
+
 
         ###########################################################
         # Fusion                                                  #
         ###########################################################
 
         dino_query = refined_embeddings.flatten(2).transpose(1, 2)
+        print(f"\n--- dino_query ---")
+        print(f"Type:       {dino_query.dtype}")
+        print(f"Device:     {dino_query.device}")
+        print(f"Shape:      {tuple(dino_query.shape)}")
+        print(f"Dimensions: {dino_query.ndim}")
+        mean_val = dino_query.mean().item()
+        std_val  = dino_query.std().item()
+        min_val  = dino_query.min().item()
+        max_val  = dino_query.max().item()
+        l1_norm  = torch.norm(dino_query, p=1).item()
+        l2_norm  = torch.norm(dino_query, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
 
         diffusion_kv = self.diffusion_projection(self.diffusion_features)
+        print(f"\n--- diffusion_kv ---")
+        print(f"Type:       {diffusion_kv.dtype}")
+        print(f"Device:     {diffusion_kv.device}")
+        print(f"Shape:      {tuple(diffusion_kv.shape)}")
+        print(f"Dimensions: {diffusion_kv.ndim}")
+        mean_val = diffusion_kv.mean().item()
+        std_val  = diffusion_kv.std().item()
+        min_val  = diffusion_kv.min().item()
+        max_val  = diffusion_kv.max().item()
+        l1_norm  = torch.norm(diffusion_kv, p=1).item()
+        l2_norm  = torch.norm(diffusion_kv, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
 
         attended = self.cross_attention(
             dino_query,  
@@ -192,11 +242,80 @@ class Tracker(nn.Module):
             diffusion_kv
         )[0]
 
+        print(f"\n--- attended ---")
+        print(f"Type:       {attended.dtype}")
+        print(f"Device:     {attended.device}")
+        print(f"Shape:      {tuple(attended.shape)}")
+        print(f"Dimensions: {attended.ndim}")
+        mean_val = attended.mean().item()
+        std_val  = attended.std().item()
+        min_val  = attended.min().item()
+        max_val  = attended.max().item()
+        l1_norm  = torch.norm(attended, p=1).item()
+        l2_norm  = torch.norm(attended, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
+
         attended_embeddings = dino_query + self.output_scale * attended
+        print(f"\n--- attended_embeddings ---")
+        print(f"Type:       {attended_embeddings.dtype}")
+        print(f"Device:     {attended_embeddings.device}")
+        print(f"Shape:      {tuple(attended_embeddings.shape)}")
+        print(f"Dimensions: {attended_embeddings.ndim}")
+        mean_val = attended_embeddings.mean().item()
+        std_val  = attended_embeddings.std().item()
+        min_val  = attended_embeddings.min().item()
+        max_val  = attended_embeddings.max().item()
+        l1_norm  = torch.norm(attended_embeddings, p=1).item()
+        l2_norm  = torch.norm(attended_embeddings, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
 
         fused_embeddings = attended_embeddings + self.output_scale * self.mlp(attended_embeddings)
+        print(f"\n--- fused_embeddings ---")
+        print(f"Type:       {fused_embeddings.dtype}")
+        print(f"Device:     {fused_embeddings.device}")
+        print(f"Shape:      {tuple(fused_embeddings.shape)}")
+        print(f"Dimensions: {fused_embeddings.ndim}")
+        mean_val = fused_embeddings.mean().item()
+        std_val  = fused_embeddings.std().item()
+        min_val  = fused_embeddings.min().item()
+        max_val  = fused_embeddings.max().item()
+        l1_norm  = torch.norm(fused_embeddings, p=1).item()
+        l2_norm  = torch.norm(fused_embeddings, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
 
         fused_embeddings = fused_embeddings.transpose(1, 2).reshape(refined_embeddings.shape)
+        print(f"\n--- fused_embeddings ---")
+        print(f"Type:       {fused_embeddings.dtype}")
+        print(f"Device:     {fused_embeddings.device}")
+        print(f"Shape:      {tuple(fused_embeddings.shape)}")
+        print(f"Dimensions: {fused_embeddings.ndim}")
+        mean_val = fused_embeddings.mean().item()
+        std_val  = fused_embeddings.std().item()
+        min_val  = fused_embeddings.min().item()
+        max_val  = fused_embeddings.max().item()
+        l1_norm  = torch.norm(fused_embeddings, p=1).item()
+        l2_norm  = torch.norm(fused_embeddings, p=2).item()
+        print(f"Mean:       {mean_val:.6f}")
+        print(f"Std:        {std_val:.6f}")
+        print(f"Min:        {min_val:.6f}")
+        print(f"Max:        {max_val:.6f}")
+        print(f"L1 Norm:    {l1_norm:.6f}")
+        print(f"L2 Norm:    {l2_norm:.6f}")
 
         ###########################################################
 
