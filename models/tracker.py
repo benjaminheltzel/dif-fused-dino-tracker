@@ -114,7 +114,7 @@ class Tracker(nn.Module):
             batch_first=True
         )
 
-        self.output_scale = nn.Parameter(torch.ones(1) * 0.1)
+        self.output_scale = nn.Parameter(torch.ones(1) * 0.2)
 
         self.mlp = nn.Sequential(
             nn.Linear(dino_dim, dino_dim * 4),
@@ -261,10 +261,10 @@ class Tracker(nn.Module):
             diffusion_embeddings
         )[0]
 
-        attended_embeddings = dino_query + attended
+        attended_embeddings = dino_query + self.output_scale * attended
         #self.print_tensor_stats("attended_embeddings", attended_embeddings)
 
-        fused_embeddings = attended_embeddings + self.mlp(attended_embeddings)
+        fused_embeddings = attended_embeddings + self.output_scale * self.mlp(attended_embeddings)
         #self.print_tensor_stats("fused_embeddings", fused_embeddings)
 
         fused_embeddings = fused_embeddings.transpose(1, 2).reshape(B, C, H, W)
