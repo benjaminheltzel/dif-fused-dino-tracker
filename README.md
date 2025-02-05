@@ -14,4 +14,4 @@
 1. Extract CogVideoX diffusion features from video w/ notebook: diffusion_feature_extractor.ipynb
 2. Save features to folder ./diffusion/<video-id>
 3. Run point tracking model w/ notebook: dif-fused-dino-tracker.ipynb
-4. Watch your colab credits get Thanos-snapped 👍
+4. Watch your colab credits get Thanos-snapped 🫡
