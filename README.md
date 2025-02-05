@@ -1,4 +1,4 @@
-# Dif-fused DINO-tracker: Zero-shot Point Tracking Enhanced with Video Diffusion
+# 🦖 Dif-fused DINO-tracker: Zero-shot Point Tracking Enhanced with Video Diffusion 
 
 ## Motivation: 
 - Point tracking enables key computer vision tasks, but tracking through occlusions remains challenging
